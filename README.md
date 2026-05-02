@@ -126,6 +126,18 @@ layers:
 ```
 
 Layer order matters (bottom-most first). Inspect the downloaded directory (or the site's JSON export) to choose the exact paths you need. You can also pass repeated `--layer` flags instead of a file.
+不想手写清单？`data.random_composer` 可以在本地素材中随机抽取层组合，直接生成多组完整人物：
+
+```bash README.md
+python -m data.random_composer \
+    --assets-root data/raw_lpc_repo \
+    --out-dir data/pairs/random_batch \
+    --count 32 \
+    --seed 42 \
+    --prefix rand
+```
+
+默认会尝试组合 `body → legs → torso → head → hair → feet` 六大类，如果某类素材缺失则自动跳过；你也可以通过 `--groups body head torso` 指定需要的层。
 
 The extractor reads the **idle frame** (column 0) from the standard LPC rows:
 - Row 2 → **front view** (walk-down direction)

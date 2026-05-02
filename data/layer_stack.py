@@ -13,13 +13,23 @@ import json
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-import yaml
+try:
+    import yaml  # type: ignore
+except ImportError:  # pragma: no cover - handled at runtime
+    yaml = None
 
 from data.spritesheet_utils import compose_layers, save_pair
 
 
 def _load_layers_from_file(path: Path) -> List[str]:
-    data = yaml.safe_load(path.read_text()) if path.suffix in {".yml", ".yaml"} else json.loads(path.read_text())
+    if path.suffix.lower() in {".yml", ".yaml"}:
+        if yaml is None:
+            raise RuntimeError(
+                "PyYAML is required to read YAML layer files. Install it (pip install PyYAML)."
+            )
+        data = yaml.safe_load(path.read_text())
+    else:
+        data = json.loads(path.read_text())
     if isinstance(data, dict):
         layers = data.get("layers")
     else:
