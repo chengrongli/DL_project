@@ -28,6 +28,7 @@ from data.spritesheet_utils import (
 from data.augmentation import (
     random_horizontal_flip,
     random_color_jitter,
+    random_palette_shift,
     random_occlusion,
     to_tensor_pair,
 )
@@ -196,6 +197,19 @@ def test_random_occlusion_shape():
     img = Image.new("RGBA", (64, 64), (100, 100, 100, 255))
     result = random_occlusion(img, p=1.0)  # always occlude
     assert result.size == img.size
+
+
+def test_random_palette_shift_changes_color():
+    import random
+    front = Image.new("RGBA", (32, 32), (100, 50, 200, 255))
+    back = Image.new("RGBA", (32, 32), (20, 150, 80, 128))
+    random.seed(0)
+    f2, b2 = random_palette_shift(front, back, p=1.0)
+    assert f2.size == front.size
+    assert f2.mode == "RGBA"
+    assert b2.mode == "RGBA"
+    assert not np.array_equal(np.array(front)[:, :, :3], np.array(f2)[:, :, :3])
+    assert not np.array_equal(np.array(back)[:, :, :3], np.array(b2)[:, :, :3])
 
 
 def test_to_tensor_pair_range():

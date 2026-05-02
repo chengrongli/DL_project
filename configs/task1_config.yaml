@@ -6,8 +6,9 @@
 data:
   # Path to pre-extracted front/back pair images OR a CSV index.
   # Run `python data/dataset.py` (or build_and_save_index) first to populate.
-  # A small sample dataset is provided under data/pairs/random_batch for quick tests.
-  train_dir: "data/pairs/random_batch"
+  # For rich palette diversity, default to the full LPC asset extraction.
+  train_dir: "data/pairs/all"
+  # Validation defaults to the lightweight bundle for quick sanity checks.
   val_dir:   "data/pairs/random_batch"
   image_size: 64
 
@@ -31,7 +32,7 @@ diffusion:
 
 training:
   device:           "cuda"
-  epochs:           200
+  epochs:           1000
   batch_size:       64
   num_workers:      4
   lr:               2.0e-4
