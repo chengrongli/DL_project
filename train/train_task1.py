@@ -51,6 +51,23 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _resolve_device(device_str: str | None) -> torch.device:
+    if device_str is None or device_str.lower() == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    try:
+        device = torch.device(device_str)
+    except Exception:
+        print(f"Unknown device '{device_str}', falling back to CPU.")
+        return torch.device("cpu")
+
+    if device.type == "cuda" and not torch.cuda.is_available():
+        print("CUDA requested but not available; falling back to CPU.")
+        return torch.device("cpu")
+
+    return device
+
+
 def build_model(cfg: dict, device: torch.device):
     """Build U-Net + diffusion wrapper from config dict."""
     unet = UNet(
@@ -141,7 +158,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    device = torch.device(cfg["training"].get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    device = _resolve_device(cfg["training"].get("device"))
     print(f"Using device: {device}")
 
     # Datasets

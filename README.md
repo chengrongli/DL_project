@@ -136,10 +136,11 @@ python -m data.random_composer \
     --out-dir data/pairs/random_batch \
     --count 32 \
     --seed 42 \
-    --prefix rand
+    --prefix rand \
+    --palette-shift-prob 0.8  # 强烈推荐：随机调色，生成更多彩的衣物/饰品
 ```
 
-默认会尝试组合 `body → legs → torso → head → hair → feet` 六大类，如果某类素材缺失则自动跳过；你也可以通过 `--groups body head torso` 指定需要的层。
+默认会尝试组合 `body → legs → torso → head → hair → feet` 六大类，如果某类素材缺失则自动跳过；你也可以通过 `--groups body head torso` 指定需要的层。调色幅度可通过 `--palette-hue/--palette-saturation/--palette-value` 控制，若想保持原色，把 `--palette-shift-prob` 设为 `0` 即可。
 
 The extractor reads the **idle frame** (column 0) from the standard LPC rows:
 - Row 2 → **front view** (walk-down direction)
