@@ -104,14 +104,15 @@ def train_epoch(
 
         cond_emb = None
         if attr_emb is not None:
-            # In a real run, attrs would come from the batch metadata.
-            # Here we pass empty dicts → attribute embedding falls back to null.
-            cond_emb = attr_emb({}, force_null=False) if hasattr(attr_emb, "__call__") else None
+            if "attrs" in batch and batch["attrs"]:
+                cond_emb = attr_emb(batch["attrs"])  # type: ignore[arg-type]
+            elif hasattr(attr_emb, "get_null_embedding"):
+                cond_emb = attr_emb.get_null_embedding(B, device)
 
         optimizer.zero_grad()
 
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type="cuda"):
                 loss = diffusion.p_losses(paired, t, cond_emb=cond_emb)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -191,7 +192,7 @@ def main() -> None:
 
     # Mixed precision
     use_amp = cfg["training"].get("mixed_precision", False) and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
     # Resume
     start_epoch = 0

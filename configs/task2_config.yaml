@@ -4,8 +4,8 @@
 #   python train/train_task2.py --config configs/task2_config.yaml
 
 data:
-  train_dir:   "data/pairs/train"
-  val_dir:     "data/pairs/val"
+  train_dir:   "data/pairs/random_batch"  # Small sample dataset bundled with the repo
+  val_dir:     "data/pairs/random_batch"
   image_size:  64
   occlusion_p: 0.3     # probability of applying random occlusion augmentation
 

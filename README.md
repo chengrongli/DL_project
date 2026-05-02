@@ -55,6 +55,8 @@ pip install -r requirements.txt
 
 ### 2. Prepare data
 
+A tiny demo dataset (32 random composites) is already bundled under `data/pairs/random_batch/`. The default training configs point to this directory so you can sanity-check the pipeline immediately after installation. For meaningful training runs you should replace it with your own split, as described below.
+
 Place your LPC spritesheet PNG files in a directory (e.g. `data/raw_sprites/`), then extract front/back pairs:
 
 ```python

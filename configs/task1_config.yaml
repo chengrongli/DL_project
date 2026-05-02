@@ -6,8 +6,9 @@
 data:
   # Path to pre-extracted front/back pair images OR a CSV index.
   # Run `python data/dataset.py` (or build_and_save_index) first to populate.
-  train_dir: "data/pairs/train"
-  val_dir:   "data/pairs/val"
+  # A small sample dataset is provided under data/pairs/random_batch for quick tests.
+  train_dir: "data/pairs/random_batch"
+  val_dir:   "data/pairs/random_batch"
   image_size: 64
 
 model:

@@ -46,7 +46,9 @@ def save_sample_grid(
     Save a grid of sample tensors to an image file.
 
     Args:
-        samples: (N, C, H, W) tensor in [−1, 1].
+        samples: (N, C, H, W) tensor in [−1, 1]. Supports multi-view tensors where
+                  C is a multiple of 3 (e.g. 6 = front/back); channels are split
+                  into separate RGB tiles before rendering.
         path:    Output file path.
         nrow:    Number of images per row.
         padding: Padding between images in the grid.
@@ -55,9 +57,18 @@ def save_sample_grid(
     samples = samples.detach().cpu().clamp(-1, 1)
     samples = (samples + 1.0) / 2.0  # → [0, 1]
 
+    N, C, H, W = samples.shape
+    if C not in (1, 3, 4):
+        if C % 3 != 0:
+            raise ValueError(
+                f"save_sample_grid expected channel count in {1, 3, 4} or a multiple of 3, got {C}"
+            )
+        samples = samples.reshape(N, C // 3, 3, H, W)
+        samples = samples.reshape(-1, 3, H, W)
+
     # Upscale each tile
+    N, C, H, W = samples.shape
     if upscale > 1:
-        N, C, H, W = samples.shape
         upscaled = torch.nn.functional.interpolate(
             samples, size=(H * upscale, W * upscale), mode="nearest"
         )
