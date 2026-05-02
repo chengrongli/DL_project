@@ -32,6 +32,7 @@ from data.augmentation import (
     to_tensor_pair,
 )
 from data.dataset import SpritePairDataset, FrontToBackDataset, _write_index
+from data.repo_extractor import extract_pairs_from_repo
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +122,52 @@ def test_build_pair_dataset(tmp_path):
     for fp, bp in pairs:
         assert os.path.isfile(fp)
         assert os.path.isfile(bp)
+
+# ---------------------------------------------------------------------------
+# repo_extractor
+# ---------------------------------------------------------------------------
+
+def test_extract_pairs_from_repo(tmp_path):
+    repo_root = tmp_path / "repo"
+    male_dir = repo_root / "spritesheets" / "body" / "bodies" / "male"
+    armor_dir = repo_root / "spritesheets" / "torso" / "armor"
+    male_dir.mkdir(parents=True)
+    armor_dir.mkdir(parents=True)
+
+    sheet = _make_spritesheet()
+    sheet.save(str(male_dir / "walk.png"))
+    sheet.save(str(armor_dir / "walk.png"))
+
+    out_dir = tmp_path / "out"
+    index_path = tmp_path / "pairs.csv"
+
+    result = extract_pairs_from_repo(
+        repo_root=str(repo_root),
+        out_dir=str(out_dir),
+        index_path=str(index_path),
+        include_patterns=("walk.png",),
+    )
+
+    assert result.successful == 2
+    assert not result.failed_paths
+
+    front_paths = {
+        out_dir / "spritesheets" / "body" / "bodies" / "male" / "walk_front.png",
+        out_dir / "spritesheets" / "torso" / "armor" / "walk_front.png",
+    }
+
+    for fp in front_paths:
+        assert fp.exists()
+
+    import csv
+
+    with index_path.open(newline="") as f:
+        reader = csv.reader(f)
+        rows = [row for row in reader if row and not row[0].startswith("#")]
+
+    assert len(rows) == 2
+    indexed_fronts = {row[0] for row in rows}
+    assert all(str(fp) in indexed_fronts for fp in front_paths)
 
 
 # ---------------------------------------------------------------------------

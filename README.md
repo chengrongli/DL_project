@@ -67,6 +67,66 @@ pairs = build_and_save_index(
 )
 ```
 
+If you already cloned the [Universal LPC Spritesheet Character Generator](https://github.com/LiberatedPixelCup/Universal-LPC-Spritesheet-Character-Generator), you can mirror its asset hierarchy into paired idle views with:
+
+```bash README.md
+python -m data.repo_extractor \
+    --repo-root /path/to/Universal-LPC-Spritesheet-Character-Generator \
+    --out-dir data/pairs/lpc_repo \
+    --index data/index_lpc_repo.csv \
+    --patterns "*walk.png"
+```
+
+This script preserves the upstream directory layout under `data/pairs` and produces a CSV index that can be fed directly into `SpritePairDataset`.
+
+> **Tip – download only what you need.** Instead of cloning the entire Universal LPC repository, perform a sparse clone that keeps only the sprite directories:
+>
+> ```bash README.md
+> python -m data.repo_sparse_clone \
+>     --dest data/raw_lpc_repo \
+>     --depth 1 \
+>     --force
+> ```
+>
+> 这会使用 `git --sparse` 只拉取 `spritesheets/**` 中默认的核心目录；若需要额外子目录，可追加 `--path spritesheets/...` 或准备一个列表文件并通过 `--paths-file` 传入。
+>
+> 如果你无法使用 git 或网络受限，也可以继续使用 `data.repo_downloader`（基于 HTTP 下载单个文件），但需要配置 `--token`/`--use-tree` 以避免 GitHub API 速率限制。
+>
+> 下载完成后，使用 `repo_extractor` 从稀疏克隆中抽取正/背面：
+>
+> ```bash README.md
+> python -m data.repo_extractor \
+>     --repo-root data/raw_lpc_repo \
+>     --out-dir data/pairs/lpc_repo \
+>     --index data/index_lpc_repo.csv \
+>     --patterns "*walk.png"
+> ```
+>
+> 这一步会在 `data/pairs/lpc_repo/` 下生成前后视图 PNG，并写出可直接喂入 `SpritePairDataset` 的索引。
+
+To compose a **complete character** from the layers you downloaded (body, head, outfit, etc.), use `data.layer_stack`:
+
+```bash README.md
+python -m data.layer_stack \
+    --assets-root data/raw_lpc_subset \
+    --out-dir data/pairs/custom \
+    --name hero01 \
+    --layers-file configs/hero01_layers.yaml
+```
+
+A simple YAML file can look like:
+
+```yaml README.md
+layers:
+  - spritesheets/body/bodies/male/walk.png                # base body
+  - spritesheets/head/.../walk.png                         # replace with head layer
+  - spritesheets/torso/.../walk.png                        # outfit / armor
+  - spritesheets/legs/.../walk.png                         # pants / legs
+  - spritesheets/hair/.../walk.png                         # optional hair, etc.
+```
+
+Layer order matters (bottom-most first). Inspect the downloaded directory (or the site's JSON export) to choose the exact paths you need. You can also pass repeated `--layer` flags instead of a file.
+
 The extractor reads the **idle frame** (column 0) from the standard LPC rows:
 - Row 2 → **front view** (walk-down direction)
 - Row 0 → **back view**  (walk-up direction)
