@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model outputs and checkpoints
+outputs/
+*.pth
+*.ckpt
+
+# Data (raw and processed – add your own paths as needed)
+data/raw_sprites/
+data/pairs/
+data/index_*.csv
+
+# TensorBoard logs
+runs/
+
+# Misc
+.DS_Store
+*.log

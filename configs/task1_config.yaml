@@ -1,0 +1,48 @@
+# Task 1 – Random front+back joint generation
+# -----------------------------------------------
+# Train with:
+#   python train/train_task1.py --config configs/task1_config.yaml
+
+data:
+  # Path to pre-extracted front/back pair images OR a CSV index.
+  # Run `python data/dataset.py` (or build_and_save_index) first to populate.
+  train_dir: "data/pairs/train"
+  val_dir:   "data/pairs/val"
+  image_size: 64
+
+model:
+  # U-Net produces 6-channel output (front[3] + back[3])
+  in_channels:      6
+  out_channels:     6
+  model_channels:   64
+  channel_mults:    [1, 2, 4, 8]
+  n_res_blocks:     2
+  attn_resolutions: [8]          # apply attention at 8×8 spatial resolution
+  time_emb_dim:     256
+  cond_emb_dim:     256          # attribute embedding dim; set 0 to disable
+  dropout:          0.1
+
+diffusion:
+  timesteps:  1000
+  schedule:   "cosine"           # "linear" or "cosine"
+  loss_type:  "l2"               # "l1" or "l2"
+  ddim_steps: 50                 # steps used during inference
+
+training:
+  device:           "cuda"
+  epochs:           200
+  batch_size:       64
+  num_workers:      4
+  lr:               2.0e-4
+  lr_min:           1.0e-6
+  weight_decay:     1.0e-4
+  mixed_precision:  true         # AMP (requires CUDA)
+  p_uncond:         0.1          # CFG null-drop probability during training
+
+  # Evaluation / logging intervals (in epochs)
+  val_every:    5
+  save_every:   10
+  sample_every: 10
+
+  # Output directory
+  out_dir: "outputs/task1"
