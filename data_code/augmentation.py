@@ -144,22 +144,25 @@ def random_occlusion(
 
 
 def _rgba_to_rgba_tensor(img: Image.Image, size: int) -> torch.Tensor:
-    """把 PIL RGBA 图转为 (4, H, W) 张量，RGB 在 [−1, 1]、A 在 [−1, 1]。
+    """把 PIL RGBA 图转为 (4, H, W) 张量，RGB/A 都映射到 [-1, 1]。
 
-    关键修复：透明像素的 RGB 会被强制为 0（归一化后为 -1，即黑色）。
-    LPC/一般的 PNG 透明区域常有 “垃圾 RGB”（如 (255,0,0,0)），直接拿来
-    训练会导致背景被模型记下为红色/垃圾色。
+    关键修复（稳定训练）：
+    1) 透明像素 RGB 清零，去掉 PNG 中常见的隐藏垃圾色；
+    2) 对半透明像素执行 alpha 预乘（premultiply），避免边缘处 RGB 与 A
+       不一致带来的高频噪声，减轻训练中背景发散/崩溃风险。
     """
     rgba = img.convert("RGBA").resize((size, size), Image.NEAREST)
-    # 把 alpha=0 的 RGB 强制清洗为 0
-    np_rgba = np.array(rgba, dtype=np.uint8)  # (H, W, 4)
-    a = np_rgba[..., 3:4]  # (H, W, 1)
+
+    np_rgba = np.array(rgba, dtype=np.float32)  # (H, W, 4)
     rgb = np_rgba[..., :3]
-    mask = (a > 0).astype(np.uint8)  # 1 if visible, 0 otherwise
-    rgb = rgb * mask  # zero out invisible pixels' RGB
-    cleaned = np.concatenate([rgb, a], axis=-1)  # (H, W, 4)
+    alpha = np_rgba[..., 3:4] / 255.0  # [0,1]
+
+    # 透明区域强制黑底；半透明区域做预乘，去掉“看不见但颜色很亮”的噪声来源。
+    rgb = rgb * alpha
+
+    cleaned = np.concatenate([rgb, alpha * 255.0], axis=-1).clip(0.0, 255.0).astype(np.uint8)
     t = torch.from_numpy(cleaned).permute(2, 0, 1).float() / 255.0  # (4, H, W) in [0,1]
-    t = t * 2.0 - 1.0  # 统一到 [-1, 1]，包括 alpha（这样全模型 I/O 一致）
+    t = t * 2.0 - 1.0
     return t
 
 
@@ -173,7 +176,8 @@ def to_tensor_pair(
 
     默认模式 ``hstack_rgba``：
         - 每张图转成 (4, H, W)，RGB、A 都在 [-1, 1]。
-        - 透明像素的 RGB 被清理为 0（归一化后 -1），避免 PNG 垃圾值座数据。
+        - 透明像素 RGB 会被清理（并对半透明边缘做 alpha 预乘），
+          避免 PNG 背景隐藏色造成训练不稳定。
 
     Returns:
         front_tensor: (4, H, W) float32 in [-1, 1]，第 4 通道为 alpha

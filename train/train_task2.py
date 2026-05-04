@@ -100,6 +100,31 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _resolve_device(device_str: str | None) -> torch.device:
+    if device_str is None or device_str.lower() == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    try:
+        device = torch.device(device_str)
+    except Exception:
+        print(f"Unknown device '{device_str}', falling back to CPU.")
+        return torch.device("cpu")
+
+    if device.type == "cuda" and not torch.cuda.is_available():
+        print("CUDA requested but not available; falling back to CPU.")
+        return torch.device("cpu")
+
+    if device.type == "mps" and not torch.backends.mps.is_available():
+        print("MPS requested but not available; falling back to CPU.")
+        return torch.device("cpu")
+
+    return device
+
+
 def build_model(cfg: dict, device: torch.device):
     unet = UNet(
         in_channels=cfg["model"]["in_channels"],    # 6 = noisy_back(3) + front_cond(3)
@@ -221,7 +246,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    device = torch.device(cfg["training"].get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    device = _resolve_device(cfg["training"].get("device"))
     print(f"Using device: {device}")
 
     # Datasets
@@ -242,18 +267,32 @@ def main() -> None:
         batch_size=cfg["training"]["batch_size"],
         shuffle=True,
         num_workers=cfg["training"].get("num_workers", 4),
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg["training"]["batch_size"],
         shuffle=False,
         num_workers=cfg["training"].get("num_workers", 4),
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
     )
 
     # Models
     diffusion = build_model(cfg, device)
+
+    # 快速一致性检查：避免“数据是 RGBA(4ch) 但模型按 RGB(3ch) 配置”这类直接崩溃。
+    sample = train_ds[0]
+    cond_ch = int(sample["condition"].shape[0])
+    target_ch = int(sample["target"].shape[0])
+    expected_in = cond_ch + target_ch
+    expected_out = target_ch
+    if cfg["model"]["in_channels"] != expected_in or cfg["model"]["out_channels"] != expected_out:
+        raise ValueError(
+            "Model/data channel mismatch: "
+            f"config in/out=({cfg['model']['in_channels']}, {cfg['model']['out_channels']}), "
+            f"but dataset implies ({expected_in}, {expected_out}). "
+            "Please update config or dataset channel settings."
+        )
     optimizer_g = optim.AdamW(
         diffusion.parameters(),
         lr=cfg["training"]["lr"],

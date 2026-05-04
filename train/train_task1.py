@@ -99,6 +99,8 @@ def train_one_epoch(
     ema_decay: float,
     global_step: int,
     background_weight: float,
+    foreground_weight: float,
+    alpha_weight: float,
     writer: SummaryWriter | None = None,
     scaler: torch.cuda.amp.GradScaler | None = None,
     warmup_steps: int = 0,
@@ -109,6 +111,11 @@ def train_one_epoch(
     pbar = tqdm(loader, leave=False, desc="  train")
 
     use_amp = scaler is not None
+    amp_dtype = (
+        torch.bfloat16
+        if use_amp and device.type == "cuda" and torch.cuda.is_bf16_supported()
+        else torch.float16
+    )
 
     for batch_idx, batch in enumerate(pbar):
         current_step = global_step + batch_idx
@@ -123,20 +130,52 @@ def train_one_epoch(
         mask = batch["mask"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
 
-        if use_amp:
-            with torch.cuda.amp.autocast():
-                loss = model.compute_losses(
-                    images, fg_mask=mask, background_weight=background_weight
+        if not torch.isfinite(images).all():
+            print(f"[warn] non-finite images at step={current_step}, skipping batch")
+            continue
+
+        try:
+            if use_amp:
+                with torch.cuda.amp.autocast(dtype=amp_dtype):
+                    loss, components = model.compute_losses(
+                        images,
+                        fg_mask=mask,
+                        background_weight=background_weight,
+                        foreground_weight=foreground_weight,
+                        alpha_weight=alpha_weight,
+                        return_components=True,
+                    )
+            else:
+                loss, components = model.compute_losses(
+                    images,
+                    fg_mask=mask,
+                    background_weight=background_weight,
+                    foreground_weight=foreground_weight,
+                    alpha_weight=alpha_weight,
+                    return_components=True,
                 )
+        except RuntimeError as e:
+            if device.type == "cuda" and "out of memory" in str(e).lower():
+                print(f"[OOM] step={current_step}, skip batch. Consider lowering batch_size.")
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                continue
+            raise
+
+        if not torch.isfinite(loss):
+            print(f"[warn] non-finite loss at step={current_step}, skipping optimizer step")
+            optimizer.zero_grad(set_to_none=True)
+            if scaler is not None:
+                scaler.update()
+            continue
+
+        if use_amp:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
-            loss = model.compute_losses(
-                images, fg_mask=mask, background_weight=background_weight
-            )
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -146,9 +185,13 @@ def train_one_epoch(
                 ema_param.data.mul_(ema_decay).add_(param.data, alpha=1.0 - ema_decay)
 
         total_loss += loss.item()
-        pbar.set_postfix({"loss": loss.item()})
+        fg_dbg = float(components.get("loss_fg_rgb", torch.tensor(float("nan"))).item())
+        bg_dbg = float(components.get("loss_bg_rgb", torch.tensor(float("nan"))).item())
+        pbar.set_postfix({"loss": loss.item(), "fg": fg_dbg, "bg": bg_dbg})
         if writer is not None:
             writer.add_scalar("loss/train_iter", loss.item(), current_step)
+            for k, v in components.items():
+                writer.add_scalar(f"loss/{k}", float(v.item()), current_step)
 
     avg_loss = total_loss / max(1, len(loader))
     new_step = global_step + len(loader)
@@ -161,13 +204,21 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     background_weight: float,
+    foreground_weight: float,
+    alpha_weight: float,
 ) -> float:
     model.eval()
     total = 0.0
     for batch in loader:
         images = batch["paired"].to(device)
         mask = batch["mask"].to(device)
-        loss = model.compute_losses(images, fg_mask=mask, background_weight=background_weight)
+        loss = model.compute_losses(
+            images,
+            fg_mask=mask,
+            background_weight=background_weight,
+            foreground_weight=foreground_weight,
+            alpha_weight=alpha_weight,
+        )
         total += loss.item()
     return total / max(1, len(loader))
 
@@ -206,7 +257,13 @@ def main() -> None:
     # 默认 1.0（不对背景降权），这样才是标准 DDPM 损失。
     # 旧默认值 0.05 会导致背景噪声学不好，采样出现彩色噪声。
     background_weight = cfg["training"].get("background_weight", 1.0)
-    print(f"background_weight = {background_weight}")
+    foreground_weight = cfg["training"].get("foreground_weight", 1.0)
+    alpha_weight = cfg["training"].get("alpha_weight", 1.0)
+    print(
+        f"background_weight = {background_weight}, "
+        f"foreground_weight = {foreground_weight}, "
+        f"alpha_weight = {alpha_weight}"
+    )
 
     # Datasets
     train_ds = SpritePairDataset(
@@ -241,6 +298,19 @@ def main() -> None:
         collate_fn=_paired_collate_fn,
     )
 
+    # 启动前一致性检查，提前拦截通道错配导致的训练崩溃。
+    sample = train_ds[0]
+    paired = sample["paired"]
+    mask = sample["mask"]
+    if paired.shape[0] != cfg["model"]["in_channels"] or paired.shape[0] != cfg["model"]["out_channels"]:
+        raise ValueError(
+            "Task1 model/data channel mismatch: "
+            f"paired channels={paired.shape[0]}, "
+            f"config in/out=({cfg['model']['in_channels']}, {cfg['model']['out_channels']})."
+        )
+    if mask.shape[0] != 1:
+        raise ValueError(f"Task1 expected mask channel=1, got {mask.shape[0]}")
+
     diffusion_config = DiffusionConfig(
         timesteps=cfg["diffusion"]["timesteps"],
         device=device,
@@ -270,11 +340,25 @@ def main() -> None:
         weight_decay=cfg["training"].get("weight_decay", 1e-4),
     )
 
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=cfg["training"]["epochs"],
-        eta_min=cfg["training"].get("lr_min", 1e-6),
-    )
+    lr_drop_milestones = cfg["training"].get("lr_drop_milestones", [])
+    if lr_drop_milestones:
+        scheduler = optim.lr_scheduler.MultiStepLR(
+            optimizer,
+            milestones=[int(m) for m in lr_drop_milestones],
+            gamma=float(cfg["training"].get("lr_drop_gamma", 0.2)),
+        )
+        print(
+            "Using MultiStepLR: "
+            f"milestones={lr_drop_milestones}, "
+            f"gamma={cfg['training'].get('lr_drop_gamma', 0.2)}"
+        )
+    else:
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cfg["training"]["epochs"],
+            eta_min=cfg["training"].get("lr_min", 1e-6),
+        )
+        print("Using CosineAnnealingLR")
 
     ema_decay = cfg["training"].get("ema_decay", 0.9999)
 
@@ -307,8 +391,15 @@ def main() -> None:
             ema_model.load_state_dict(ddpm_model.state_dict())
         if "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if "scheduler_state_dict" in ckpt:
+            if cfg["training"].get("resume_reset_optimizer_lr", True):
+                for pg in optimizer.param_groups:
+                    pg["lr"] = base_lr
+                print(f"Resume: reset optimizer lr to config value {base_lr:.2e}")
+        if "scheduler_state_dict" in ckpt and not cfg["training"].get("resume_skip_scheduler", True):
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            print("Resume: loaded scheduler state from checkpoint")
+        else:
+            print("Resume: scheduler state skipped (using config-defined schedule)")
         start_epoch = ckpt.get("epoch", 0) + 1
         global_step = start_epoch * len(train_loader)
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
@@ -332,6 +423,8 @@ def main() -> None:
             ema_decay,
             global_step,
             background_weight,
+            foreground_weight,
+            alpha_weight,
             writer,
             scaler=scaler,
             warmup_steps=warmup_steps,
@@ -347,7 +440,14 @@ def main() -> None:
         print(f"Epoch {epoch + 1:04d}  loss={train_loss:.5f}  lr={lr:.2e}")
 
         if val_loader is not None and (epoch + 1) % val_every == 0:
-            val_loss = evaluate(ddpm_model, val_loader, device, background_weight)
+            val_loss = evaluate(
+                ddpm_model,
+                val_loader,
+                device,
+                background_weight,
+                foreground_weight,
+                alpha_weight,
+            )
             writer.add_scalar("loss/val", val_loss, epoch)
             print(f"  val_loss={val_loss:.5f}")
 

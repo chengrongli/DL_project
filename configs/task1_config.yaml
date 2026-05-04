@@ -33,22 +33,30 @@ diffusion:
 training:
   device:           "cuda"
   epochs:           2000           # DDPM 需要大量 iter 才能收敛，200 远远不够
-  batch_size:       128
+  batch_size:       32            # 64x128 RGBA + U-Net 注意力下 128 容易 OOM 崩溃
   num_workers:      4
-  lr:               2.0e-4
+  lr:               1.0e-4
   lr_min:           1.0e-6
+  # 在约 50 epoch 做大幅降学习率，抑制前景 loss 震荡。
+  # 若不填 milestones，则退回 cosine 调度。
+  lr_drop_milestones: [50, 120, 240]
+  lr_drop_gamma:      0.2
   weight_decay:     1.0e-4
-  warmup_steps:     1000           # 线性 warmup 步数，让训练初期更稳
-  mixed_precision:  true           # AMP (requires CUDA)
+  warmup_steps:     3000           # 线性 warmup 步数，让训练初期更稳
+  mixed_precision:  true           # AMP (requires CUDA); 若仍不稳可先设为 false
   ema_decay:        0.9999
   p_uncond:         0.1            # CFG null-drop probability during training (目前未使用)
-  # 背景加权：1.0 表示标准 DDPM 损失，不对背景降权。
-  # 设得太低（如 0.05）会导致背景噪声预测学不好，采样出现彩色噪声块。
-  background_weight: 1.0
+  # 损失加权（用于 debug “loss 很低但图像乱码”）
+  # - background_weight < 1 会降低背景占比
+  # - foreground_weight > 1 会提升前景 RGB 梯度
+  # - alpha_weight 可单独调 alpha 通道学习强度
+  background_weight: 0.5
+  foreground_weight: 8.0
+  alpha_weight:      0.7
 
   # Evaluation / logging intervals (in epochs)
-  val_every:    50
-  save_every:   200
+  val_every:    5
+  save_every:   100
   sample_every: 50
 
   # 采样预览网格

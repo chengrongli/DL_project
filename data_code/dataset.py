@@ -196,9 +196,13 @@ class FrontToBackDataset(_BaseSpriteDataset):
     Dataset for Task 2: image-to-image conditional diffusion where the
     front view is the conditioning signal and the back view is the target.
 
+    注意：底层解码仍走 RGBA 清洗流程（用于稳健处理 PNG 透明背景），
+    但 Task 2 训练默认只使用 RGB 三通道；alpha 单独作为 ``target_alpha``
+    返回用于可选加权/评估。
+
     __getitem__ returns a dict:
-        "condition":    (C, H, W)  front image in [−1, 1] — model input
-        "target":       (C, H, W)  back image  in [−1, 1] — reconstruction target
+        "condition":    (3, H, W)  front RGB in [−1, 1] — model input
+        "target":       (3, H, W)  back RGB  in [−1, 1] — reconstruction target
         "target_alpha": (1, H, W)  binary mask of back-view foreground
     """
 
@@ -221,6 +225,11 @@ class FrontToBackDataset(_BaseSpriteDataset):
             front_img = random_occlusion(front_img, p=self.occlusion_p)
 
         cond_t, target_t, _, target_alpha = self._to_tensor(front_img, back_img)
+
+        # Task 2 使用 RGB 条件/目标，避免与配置中的 6=3+3 输入通道不一致。
+        # alpha 作为独立 mask 返回，不丢失前景位置信息。
+        cond_t = cond_t[:3, :, :]
+        target_t = target_t[:3, :, :]
 
         if self.transform is not None:
             cond_t, target_t = self.transform(cond_t, target_t)

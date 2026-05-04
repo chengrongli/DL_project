@@ -307,16 +307,24 @@ class DDPM(nn.Module):
         self.config = config
         self.model = model  # UNet模型，预测噪声ϵ
 
-    def compute_losses(self, x0, fg_mask=None, background_weight: float = 1.0):
-        """计算简化损失 L_simple（论文公式14）
+    def compute_losses(
+        self,
+        x0,
+        fg_mask=None,
+        background_weight: float = 1.0,
+        foreground_weight: float = 1.0,
+        alpha_weight: float = 1.0,
+        return_components: bool = False,
+    ):
+        """计算简化损失 L_simple（论文公式14）并可返回分解项（便于 debug）。
 
         Args:
             x0:  (B, C, H, W) 干净图像。
-            fg_mask: 可选的前景 mask，形状 (B, 1, H, W) 或 (B, C', H, W)，值域 [0, 1]。
-            background_weight: 背景像素的损失权重，范围 [0, 1]。
-                - 1.0（默认）等价于不加权，完全按标准 DDPM 损失训练。
-                - 小于 1.0 时会降低背景噪声预测的权重，但不建议小于 0.25，
-                  否则背景区域噪声学不好，采样时会出现彩色噪声块（黄紫乱码）。
+            fg_mask: 可选前景 mask，(B,1,H,W) 或 (B,C',H,W)，值域 [0,1]。
+            background_weight: 背景损失权重（<=1 会降低背景权重）。
+            foreground_weight: 前景额外放大系数（>=1 时提升前景梯度）。
+            alpha_weight: RGBA 下 alpha 通道损失权重。
+            return_components: True 时返回 (loss, components_dict)。
         """
         batch_size = x0.shape[0]
 
@@ -331,32 +339,75 @@ class DDPM(nn.Module):
 
         # 预测噪声
         noise_pred = self.model(xt, t)
-
         diff = (noise_pred - noise) ** 2
 
-        # 如果不加权（background_weight >= 1.0），直接按标准 MSE 处理
-        if fg_mask is None or background_weight >= 1.0:
-            return diff.mean()
+        C = x0.shape[1]
+        rgb_slice = slice(0, min(3, C))
+        alpha_slice = slice(3, 4) if C >= 4 else None
 
-        fg_mask = fg_mask.to(x0)
-        # 将 mask 扩展到与 x0 相同的通道数
-        if fg_mask.shape[1] != x0.shape[1]:
-            if x0.shape[1] % fg_mask.shape[1] == 0:
-                repeat_factor = x0.shape[1] // fg_mask.shape[1]
-                fg_mask = fg_mask.repeat_interleave(repeat_factor, dim=1)
-            else:
-                repeat_factor = (x0.shape[1] + fg_mask.shape[1] - 1) // fg_mask.shape[1]
-                fg_mask = fg_mask.repeat(1, repeat_factor, 1, 1)[:, : x0.shape[1], :, :]
+        def _safe_div(num, den):
+            return num / den.clamp_min(1e-6)
 
-        # 夹到合理范围，避免传入了过小的 background_weight 把背景梯度压没
-        bg_w = float(max(background_weight, 0.25))
-        weights = bg_w + (1.0 - bg_w) * fg_mask  # 背景=bg_w, 前景=1.0
+        # 默认不加权
+        weights = torch.ones_like(diff)
+        fg1 = None
 
-        # 关键修复：用全局加权平均，而不是每样本先归一化再求 mean。
-        # 原实现每个样本按 weights.sum() 归一，导致 batch 内不同样本权重不可比，
-        # 并且让整批损失的绝对尺度与 MSE 脱节（等价于忽略了前景占比差异）。
-        loss = (diff * weights).sum() / weights.sum().clamp_min(1e-6)
-        return loss
+        if fg_mask is not None:
+            fg_mask = fg_mask.to(x0)
+            fg1 = fg_mask[:, :1, :, :] if fg_mask.shape[1] >= 1 else fg_mask
+
+            # 扩展到通道维
+            if fg_mask.shape[1] != x0.shape[1]:
+                if x0.shape[1] % fg_mask.shape[1] == 0:
+                    repeat_factor = x0.shape[1] // fg_mask.shape[1]
+                    fg_mask = fg_mask.repeat_interleave(repeat_factor, dim=1)
+                else:
+                    repeat_factor = (x0.shape[1] + fg_mask.shape[1] - 1) // fg_mask.shape[1]
+                    fg_mask = fg_mask.repeat(1, repeat_factor, 1, 1)[:, : x0.shape[1], :, :]
+
+            # 背景/前景基础权重
+            bg_w = float(max(background_weight, 0.05))
+            weights = bg_w + (1.0 - bg_w) * fg_mask
+
+            # 进一步放大前景区域
+            fg_w = float(max(foreground_weight, 1.0))
+            weights = weights * (1.0 + (fg_w - 1.0) * fg_mask)
+
+        # alpha 通道可单独加权
+        if alpha_slice is not None:
+            aw = float(max(alpha_weight, 0.0))
+            weights[:, alpha_slice, :, :] = weights[:, alpha_slice, :, :] * aw
+
+        loss = _safe_div((diff * weights).sum(), weights.sum())
+
+        if not return_components:
+            return loss
+
+        components = {
+            "loss_total": loss.detach(),
+            "loss_mse_raw": diff.mean().detach(),
+        }
+
+        rgb_diff = diff[:, rgb_slice, :, :] if rgb_slice.stop > 0 else diff
+
+        if fg1 is not None:
+            fg_rgb = _safe_div(
+                (rgb_diff * fg1).sum(),
+                fg1.sum() * rgb_diff.shape[1],
+            )
+            bg1 = 1.0 - fg1
+            bg_rgb = _safe_div(
+                (rgb_diff * bg1).sum(),
+                bg1.sum() * rgb_diff.shape[1],
+            )
+            components["loss_fg_rgb"] = fg_rgb.detach()
+            components["loss_bg_rgb"] = bg_rgb.detach()
+            components["fg_ratio"] = fg1.mean().detach()
+
+        if alpha_slice is not None:
+            components["loss_alpha"] = diff[:, alpha_slice, :, :].mean().detach()
+
+        return loss, components
 
     @torch.no_grad()
     def p_sample(self, xt, t):
