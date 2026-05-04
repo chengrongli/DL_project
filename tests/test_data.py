@@ -215,11 +215,15 @@ def test_random_palette_shift_changes_color():
 def test_to_tensor_pair_range():
     front = Image.new("RGB", (64, 64), (128, 64, 200))
     back = Image.new("RGB", (64, 64), (0, 0, 0))
-    ft, bt = to_tensor_pair(front, back, size=64)
+    ft, bt, fa, ba = to_tensor_pair(front, back, size=64)
     assert ft.shape == (3, 64, 64)
     assert bt.shape == (3, 64, 64)
+    assert fa.shape == (1, 64, 64)
+    assert ba.shape == (1, 64, 64)
     assert ft.min() >= -1.0 - 1e-5
     assert ft.max() <= 1.0 + 1e-5
+    assert fa.min() >= 0.0
+    assert fa.max() <= 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +255,7 @@ def test_sprite_pair_dataset_shapes(tmp_path):
     assert item["front"].shape == (3, 32, 32)
     assert item["back"].shape == (3, 32, 32)
     assert item["paired"].shape == (6, 32, 32)
+    assert item["mask"].shape == (6, 32, 32)
 
 
 def test_sprite_pair_dataset_range(tmp_path):
@@ -267,6 +272,7 @@ def test_front_to_back_dataset_shapes(tmp_path):
     item = ds[0]
     assert item["condition"].shape == (3, 32, 32)
     assert item["target"].shape == (3, 32, 32)
+    assert item["target_alpha"].shape == (1, 32, 32)
 
 
 def test_dataset_from_csv_index(tmp_path):

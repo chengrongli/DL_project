@@ -139,7 +139,7 @@ class _BaseSpriteDataset(Dataset):
         self,
         front: Image.Image,
         back: Image.Image,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return to_tensor_pair(front, back, size=self.image_size)
 
 
@@ -152,10 +152,15 @@ class SpritePairDataset(_BaseSpriteDataset):
     Dataset for Task 1: unconditional / attribute-conditioned joint
     front+back generation.
 
+    数据布局：front 和 back 水平拼接为一张 2:1 的大图，包含 4 通道（RGBA）。
+    这样 UNet 的输入/输出统一为 (4, H, 2W)，避免了 6 通道版本那种
+    将 front/back “塞到通道维度”的不自然方式。
+
     __getitem__ returns a dict:
-        "front":  (C, H, W) float32 in [−1, 1]
-        "back":   (C, H, W) float32 in [−1, 1]
-        "paired": (2*C, H, W) concatenation of front and back (convenience)
+        "front":  (4, H, W) float32 in [−1, 1]
+        "back":   (4, H, W) float32 in [−1, 1]
+        "paired": (4, H, 2W) 水平拼接的训练输入
+        "mask":   (1, H, 2W) 二值前景 mask（主要用于诊断、或可选加权）
     """
 
     def __getitem__(self, idx: int):  # type: ignore[override]
@@ -164,17 +169,21 @@ class SpritePairDataset(_BaseSpriteDataset):
         if self.augment:
             front_img, back_img = self._apply_augment(front_img, back_img)
 
-        front_t, back_t = self._to_tensor(front_img, back_img)
+        front_t, back_t, front_alpha, back_alpha = self._to_tensor(front_img, back_img)
 
         if self.transform is not None:
             front_t, back_t = self.transform(front_t, back_t)
 
-        paired = torch.cat([front_t, back_t], dim=0)  # (2C, H, W)
+        # 水平拼接成 (4, H, 2W)
+        paired = torch.cat([front_t, back_t], dim=2)
+        # alpha mask 也水平拼接，维度 (1, H, 2W)
+        mask = torch.cat([front_alpha, back_alpha], dim=2)
 
         return {
             "front": front_t,
             "back": back_t,
             "paired": paired,
+            "mask": mask,
         }
 
 
@@ -188,8 +197,9 @@ class FrontToBackDataset(_BaseSpriteDataset):
     front view is the conditioning signal and the back view is the target.
 
     __getitem__ returns a dict:
-        "condition": (C, H, W)  front image in [−1, 1] — model input
-        "target":    (C, H, W)  back image  in [−1, 1] — reconstruction target
+        "condition":    (C, H, W)  front image in [−1, 1] — model input
+        "target":       (C, H, W)  back image  in [−1, 1] — reconstruction target
+        "target_alpha": (1, H, W)  binary mask of back-view foreground
     """
 
     def __init__(
@@ -210,7 +220,7 @@ class FrontToBackDataset(_BaseSpriteDataset):
             front_img, back_img = self._apply_augment(front_img, back_img)
             front_img = random_occlusion(front_img, p=self.occlusion_p)
 
-        cond_t, target_t = self._to_tensor(front_img, back_img)
+        cond_t, target_t, _, target_alpha = self._to_tensor(front_img, back_img)
 
         if self.transform is not None:
             cond_t, target_t = self.transform(cond_t, target_t)
@@ -218,6 +228,7 @@ class FrontToBackDataset(_BaseSpriteDataset):
         return {
             "condition": cond_t,
             "target": target_t,
+            "target_alpha": target_alpha,
         }
 
 

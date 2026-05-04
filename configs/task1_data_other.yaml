@@ -1,0 +1,44 @@
+# Task 1 – Training on Kaggle pixel characters (data_other)
+# ----------------------------------------------------------
+# Run with:
+#   python train/train_task1.py --config configs/task1_data_other.yaml
+
+data:
+  train_dir: "data/pairs/data_other"
+  val_dir:   "data/pairs/data_other"
+  image_size: 64
+
+model:
+  in_channels:      6
+  out_channels:     6
+  model_channels:   64
+  channel_mults:    [1, 2, 4, 8]
+  n_res_blocks:     2
+  attn_resolutions: [8, 16]
+  time_emb_dim:     256
+  cond_emb_dim:     0
+  dropout:          0.1
+
+diffusion:
+  timesteps:  1000
+  schedule:   "cosine"
+  loss_type:  "l2"
+  ddim_steps: 50
+
+training:
+  device:           "cuda"
+  epochs:           200
+  batch_size:       32
+  num_workers:      4
+  lr:               2.0e-4
+  lr_min:           1.0e-6
+  weight_decay:     1.0e-4
+  mixed_precision:  true
+  p_uncond:         0.0
+  background_weight: 0.5
+
+  val_every:    20
+  save_every:   100
+  sample_every: 100
+
+  out_dir: "outputs/task1_data_other"

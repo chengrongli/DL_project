@@ -42,20 +42,24 @@ def save_sample_grid(
     padding: int = 2,
     upscale: int = 4,
 ) -> None:
-    """
-    Save a grid of sample tensors to an image file.
+    """保存一组样本为网格图。
+
+    支持的通道数：
+      - 1: 灰度
+      - 3: RGB
+      - 4: RGBA（Alpha 也在 [-1, 1]，用于新的 hstack_rgba pipeline）
+      - C 是 3 的倍数（如 6）：拆分成多张 RGB 归併渲染（向后兼容）
 
     Args:
-        samples: (N, C, H, W) tensor in [−1, 1]. Supports multi-view tensors where
-                  C is a multiple of 3 (e.g. 6 = front/back); channels are split
-                  into separate RGB tiles before rendering.
+        samples: (N, C, H, W) tensor in [−1, 1]。对于 4 通道输入，会连同
+                  Alpha 一起保存为 PNG。
         path:    Output file path.
         nrow:    Number of images per row.
         padding: Padding between images in the grid.
         upscale: Nearest-neighbour upscale applied to each tile before saving.
     """
     samples = samples.detach().cpu().clamp(-1, 1)
-    samples = (samples + 1.0) / 2.0  # → [0, 1]
+    samples = (samples + 1.0) / 2.0  # → [0, 1]，RGB 和 Alpha 同时完成反归一化
 
     N, C, H, W = samples.shape
     if C not in (1, 3, 4):
@@ -75,9 +79,15 @@ def save_sample_grid(
     else:
         upscaled = samples
 
+    # 对于 RGBA，make_grid 会把 4 个通道一起拼。padding 区域默认填 0（透明）。
     grid = vutils.make_grid(upscaled, nrow=nrow, padding=padding, normalize=False)
     arr = (grid.permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
-    Image.fromarray(arr).save(path)
+    if arr.shape[2] == 4:
+        Image.fromarray(arr, mode="RGBA").save(path)
+    elif arr.shape[2] == 3:
+        Image.fromarray(arr, mode="RGB").save(path)
+    else:
+        Image.fromarray(arr[..., 0], mode="L").save(path)
 
 
 def side_by_side(

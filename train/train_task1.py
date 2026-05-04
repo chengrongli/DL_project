@@ -70,8 +70,9 @@ def _resolve_device(device_str: str | None) -> torch.device:
 
 
 def _paired_collate_fn(batch):
-    tensors = [item["paired"] for item in batch]
-    return torch.stack(tensors, dim=0)
+    images = torch.stack([item["paired"] for item in batch], dim=0)
+    masks = torch.stack([item["mask"] for item in batch], dim=0)
+    return {"paired": images, "mask": masks}
 
 
 def _adjust_attention_resolutions(cfg: dict) -> tuple[int, ...]:
@@ -97,27 +98,54 @@ def train_one_epoch(
     ema_model: DDPM,
     ema_decay: float,
     global_step: int,
+    background_weight: float,
     writer: SummaryWriter | None = None,
+    scaler: torch.cuda.amp.GradScaler | None = None,
+    warmup_steps: int = 0,
+    base_lr: float = 2e-4,
 ) -> tuple[float, int]:
     model.train()
     total_loss = 0.0
     pbar = tqdm(loader, leave=False, desc="  train")
 
-    for batch_idx, paired in enumerate(pbar):
-        images = paired.to(device)
-        optimizer.zero_grad()
+    use_amp = scaler is not None
 
-        loss = model.compute_losses(images)
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+    for batch_idx, batch in enumerate(pbar):
+        current_step = global_step + batch_idx
+
+        # Linear warmup on learning rate
+        if warmup_steps > 0 and current_step < warmup_steps:
+            warmup_lr = base_lr * (current_step + 1) / warmup_steps
+            for pg in optimizer.param_groups:
+                pg["lr"] = warmup_lr
+
+        images = batch["paired"].to(device, non_blocking=True)
+        mask = batch["mask"].to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+
+        if use_amp:
+            with torch.cuda.amp.autocast():
+                loss = model.compute_losses(
+                    images, fg_mask=mask, background_weight=background_weight
+                )
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss = model.compute_losses(
+                images, fg_mask=mask, background_weight=background_weight
+            )
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
         with torch.no_grad():
             for ema_param, param in zip(ema_model.parameters(), model.parameters()):
                 ema_param.data.mul_(ema_decay).add_(param.data, alpha=1.0 - ema_decay)
 
         total_loss += loss.item()
-        current_step = global_step + batch_idx
         pbar.set_postfix({"loss": loss.item()})
         if writer is not None:
             writer.add_scalar("loss/train_iter", loss.item(), current_step)
@@ -128,12 +156,18 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model: DDPM, loader: DataLoader, device: torch.device) -> float:
+def evaluate(
+    model: DDPM,
+    loader: DataLoader,
+    device: torch.device,
+    background_weight: float,
+) -> float:
     model.eval()
     total = 0.0
-    for paired in loader:
-        images = paired.to(device)
-        loss = model.compute_losses(images)
+    for batch in loader:
+        images = batch["paired"].to(device)
+        mask = batch["mask"].to(device)
+        loss = model.compute_losses(images, fg_mask=mask, background_weight=background_weight)
         total += loss.item()
     return total / max(1, len(loader))
 
@@ -168,6 +202,11 @@ def main() -> None:
     cfg = load_config(args.config)
     device = _resolve_device(cfg["training"].get("device"))
     print(f"Using device: {device}")
+
+    # 默认 1.0（不对背景降权），这样才是标准 DDPM 损失。
+    # 旧默认值 0.05 会导致背景噪声学不好，采样出现彩色噪声。
+    background_weight = cfg["training"].get("background_weight", 1.0)
+    print(f"background_weight = {background_weight}")
 
     # Datasets
     train_ds = SpritePairDataset(
@@ -239,6 +278,15 @@ def main() -> None:
 
     ema_decay = cfg["training"].get("ema_decay", 0.9999)
 
+    # AMP scaler（仅 CUDA 下生效）
+    use_amp = bool(cfg["training"].get("mixed_precision", False)) and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=True) if use_amp else None
+    if use_amp:
+        print("AMP (mixed precision) enabled")
+
+    warmup_steps = int(cfg["training"].get("warmup_steps", 0))
+    base_lr = float(cfg["training"]["lr"])
+
     out_dir = cfg["training"]["out_dir"]
     ckpt_dir = os.path.join(out_dir, "checkpoints")
     sample_dir = os.path.join(out_dir, "samples")
@@ -283,9 +331,15 @@ def main() -> None:
             ema_model,
             ema_decay,
             global_step,
+            background_weight,
             writer,
+            scaler=scaler,
+            warmup_steps=warmup_steps,
+            base_lr=base_lr,
         )
-        scheduler.step()
+        # warmup 期间先不走 cosine。warmup 结束后才开始减学习率。
+        if global_step >= warmup_steps:
+            scheduler.step()
 
         lr = scheduler.get_last_lr()[0]
         writer.add_scalar("loss/train_epoch", train_loss, epoch)
@@ -293,7 +347,7 @@ def main() -> None:
         print(f"Epoch {epoch + 1:04d}  loss={train_loss:.5f}  lr={lr:.2e}")
 
         if val_loader is not None and (epoch + 1) % val_every == 0:
-            val_loss = evaluate(ddpm_model, val_loader, device)
+            val_loss = evaluate(ddpm_model, val_loader, device, background_weight)
             writer.add_scalar("loss/val", val_loss, epoch)
             print(f"  val_loss={val_loss:.5f}")
 
@@ -310,11 +364,13 @@ def main() -> None:
             print(f"  Saved checkpoint: {ckpt_path}")
 
         if (epoch + 1) % sample_every == 0:
+            # 数据为 front/back 水平拼接，空间维度是 (H, 2W)
+            H = cfg["data"]["image_size"]
             sample_shape = (
                 sample_count,
                 cfg["model"]["out_channels"],
-                cfg["data"]["image_size"],
-                cfg["data"]["image_size"],
+                H,
+                2 * H,
             )
             sample_path = sample_and_save(
                 ema_model,

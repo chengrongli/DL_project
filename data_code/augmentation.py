@@ -46,11 +46,10 @@ def random_color_jitter(
     saturation: float = 0.1,
     hue: float = 0.05,
 ) -> Tuple[Image.Image, Image.Image]:
-    """
-    Apply identical random color jitter to both images.
+    """对 front/back 同时施加相同的随机色调扰动。
 
-    The same random parameters are sampled once and applied to both so
-    that palette consistency is preserved.
+    保留 alpha 通道：调色只作用在 RGB 上，免得 TF 函数对 RGBA 的不定行为
+    或 alpha 被调成非二值。
     """
     brightness_factor = random.uniform(max(0, 1 - brightness), 1 + brightness)
     contrast_factor = random.uniform(max(0, 1 - contrast), 1 + contrast)
@@ -58,11 +57,19 @@ def random_color_jitter(
     hue_factor = random.uniform(-hue, hue)
 
     def _jitter(img: Image.Image) -> Image.Image:
-        img = TF.adjust_brightness(img, brightness_factor)
-        img = TF.adjust_contrast(img, contrast_factor)
-        img = TF.adjust_saturation(img, saturation_factor)
-        img = TF.adjust_hue(img, hue_factor)
-        return img
+        has_alpha = (img.mode == "RGBA")
+        if has_alpha:
+            alpha = img.getchannel("A")
+            rgb = img.convert("RGB")
+        else:
+            rgb = img
+        rgb = TF.adjust_brightness(rgb, brightness_factor)
+        rgb = TF.adjust_contrast(rgb, contrast_factor)
+        rgb = TF.adjust_saturation(rgb, saturation_factor)
+        rgb = TF.adjust_hue(rgb, hue_factor)
+        if has_alpha:
+            return Image.merge("RGBA", (*rgb.split(), alpha))
+        return rgb
 
     return _jitter(front), _jitter(back)
 
@@ -136,20 +143,51 @@ def random_occlusion(
     return Image.fromarray(arr)
 
 
+def _rgba_to_rgba_tensor(img: Image.Image, size: int) -> torch.Tensor:
+    """把 PIL RGBA 图转为 (4, H, W) 张量，RGB 在 [−1, 1]、A 在 [−1, 1]。
+
+    关键修复：透明像素的 RGB 会被强制为 0（归一化后为 -1，即黑色）。
+    LPC/一般的 PNG 透明区域常有 “垃圾 RGB”（如 (255,0,0,0)），直接拿来
+    训练会导致背景被模型记下为红色/垃圾色。
+    """
+    rgba = img.convert("RGBA").resize((size, size), Image.NEAREST)
+    # 把 alpha=0 的 RGB 强制清洗为 0
+    np_rgba = np.array(rgba, dtype=np.uint8)  # (H, W, 4)
+    a = np_rgba[..., 3:4]  # (H, W, 1)
+    rgb = np_rgba[..., :3]
+    mask = (a > 0).astype(np.uint8)  # 1 if visible, 0 otherwise
+    rgb = rgb * mask  # zero out invisible pixels' RGB
+    cleaned = np.concatenate([rgb, a], axis=-1)  # (H, W, 4)
+    t = torch.from_numpy(cleaned).permute(2, 0, 1).float() / 255.0  # (4, H, W) in [0,1]
+    t = t * 2.0 - 1.0  # 统一到 [-1, 1]，包括 alpha（这样全模型 I/O 一致）
+    return t
+
+
 def to_tensor_pair(
     front: Image.Image,
     back: Image.Image,
     size: int = 64,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Resize to `size`×`size`, convert to float tensors in [−1, 1].
+    mode: str = "hstack_rgba",
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """把 front/back 图对转为张量。
+
+    默认模式 ``hstack_rgba``：
+        - 每张图转成 (4, H, W)，RGB、A 都在 [-1, 1]。
+        - 透明像素的 RGB 被清理为 0（归一化后 -1），避免 PNG 垃圾值座数据。
 
     Returns:
-        front_tensor: (C, H, W) float32 in [−1, 1]
-        back_tensor:  (C, H, W) float32 in [−1, 1]
+        front_tensor: (4, H, W) float32 in [-1, 1]，第 4 通道为 alpha
+        back_tensor:  (4, H, W) float32 in [-1, 1]
+        front_alpha:  (1, H, W) float32 in [0, 1]，二值化的前景 mask
+        back_alpha:   (1, H, W) float32 in [0, 1]
     """
-    front = front.convert("RGB").resize((size, size), Image.NEAREST)
-    back = back.convert("RGB").resize((size, size), Image.NEAREST)
-    ft = TF.to_tensor(front) * 2.0 - 1.0
-    bt = TF.to_tensor(back) * 2.0 - 1.0
-    return ft, bt
+    if mode != "hstack_rgba":
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    ft = _rgba_to_rgba_tensor(front, size)  # (4, H, W)
+    bt = _rgba_to_rgba_tensor(back, size)
+
+    # 二值化 alpha mask，从 [-1,1] 还原然后阀值
+    fa = ((ft[3:4] + 1.0) / 2.0 > 0.5).float()  # (1, H, W)
+    ba = ((bt[3:4] + 1.0) / 2.0 > 0.5).float()
+    return ft, bt, fa, ba

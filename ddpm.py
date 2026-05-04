@@ -52,6 +52,14 @@ What we need to implement? Use several $sin$ function as time embedding. (from h
 """
 
 # ==================== 2. UNet模型架构 ====================
+def _gn(channels: int, max_groups: int = 32) -> nn.GroupNorm:
+    """安全地创建 GroupNorm：groups 取 min(max_groups, channels) 并能整除 channels。"""
+    groups = min(max_groups, channels)
+    while channels % groups != 0:
+        groups //= 2
+    return nn.GroupNorm(groups, channels)
+
+
 class TimeEmbedding(nn.Module):
     """时间步的Transformer正弦位置编码（论文3.2节）"""
     def __init__(self, dim):
@@ -71,7 +79,7 @@ class ConvBlock(nn.Module):
     """卷积残差块（论文附录B）"""
     def __init__(self, in_channels, out_channels, time_emb_dim, dropout=0.1):
         super().__init__()
-        self.norm1 = nn.GroupNorm(32, in_channels)  # 使用组归一化而不是权重归一化
+        self.norm1 = _gn(in_channels)  # 使用组归一化而不是权重归一化
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
 
         self.time_mlp = nn.Sequential(
@@ -79,7 +87,7 @@ class ConvBlock(nn.Module):
             nn.Linear(time_emb_dim, out_channels)
         )
 
-        self.norm2 = nn.GroupNorm(32, out_channels)
+        self.norm2 = _gn(out_channels)
         self.dropout = nn.Dropout(dropout)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
 
@@ -112,7 +120,7 @@ class AttentionBlock(nn.Module):
     """自注意力块（论文4节，在16x16分辨率使用）"""
     def __init__(self, channels):
         super().__init__()
-        self.norm = nn.GroupNorm(32, channels)
+        self.norm = _gn(channels)
         self.q = nn.Conv2d(channels, channels, 1)
         # c^2+c parameters
         self.k = nn.Conv2d(channels, channels, 1)
@@ -180,7 +188,7 @@ class UNet(nn.Module):
                 channels = out_ch
 
                 # 检查当前分辨率是否需要注意力
-                resolution = 32 // (2 ** i)
+                resolution = 64 // (2 ** i)
                 if resolution in attention_resolutions:
                     layers.append(AttentionBlock(channels))
 
@@ -220,7 +228,7 @@ class UNet(nn.Module):
                 channels = out_ch
 
                 # 检查是否需要注意力
-                resolution = 32 // (2 ** i)
+                resolution = 64 // (2 ** i)
                 if resolution in attention_resolutions:
                     layers.append(AttentionBlock(channels))
 
@@ -234,7 +242,7 @@ class UNet(nn.Module):
         # 最后输出通道数应该是model_channels（128）
         # 但经过上采样后，channels可能是256，需要调整
         final_channels = model_channels
-        self.output_norm = nn.GroupNorm(32, channels)
+        self.output_norm = _gn(channels)
         self.output_conv = nn.Conv2d(channels, self.out_channels, 3, padding=1)
 
     def forward(self, x, t):
@@ -299,8 +307,17 @@ class DDPM(nn.Module):
         self.config = config
         self.model = model  # UNet模型，预测噪声ϵ
 
-    def compute_losses(self, x0):
-        """计算简化损失 L_simple（论文公式14）"""
+    def compute_losses(self, x0, fg_mask=None, background_weight: float = 1.0):
+        """计算简化损失 L_simple（论文公式14）
+
+        Args:
+            x0:  (B, C, H, W) 干净图像。
+            fg_mask: 可选的前景 mask，形状 (B, 1, H, W) 或 (B, C', H, W)，值域 [0, 1]。
+            background_weight: 背景像素的损失权重，范围 [0, 1]。
+                - 1.0（默认）等价于不加权，完全按标准 DDPM 损失训练。
+                - 小于 1.0 时会降低背景噪声预测的权重，但不建议小于 0.25，
+                  否则背景区域噪声学不好，采样时会出现彩色噪声块（黄紫乱码）。
+        """
         batch_size = x0.shape[0]
 
         # 随机选择时间步
@@ -315,8 +332,30 @@ class DDPM(nn.Module):
         # 预测噪声
         noise_pred = self.model(xt, t)
 
-        # 简化的MSE损失（预测噪声）
-        loss = F.mse_loss(noise_pred, noise)
+        diff = (noise_pred - noise) ** 2
+
+        # 如果不加权（background_weight >= 1.0），直接按标准 MSE 处理
+        if fg_mask is None or background_weight >= 1.0:
+            return diff.mean()
+
+        fg_mask = fg_mask.to(x0)
+        # 将 mask 扩展到与 x0 相同的通道数
+        if fg_mask.shape[1] != x0.shape[1]:
+            if x0.shape[1] % fg_mask.shape[1] == 0:
+                repeat_factor = x0.shape[1] // fg_mask.shape[1]
+                fg_mask = fg_mask.repeat_interleave(repeat_factor, dim=1)
+            else:
+                repeat_factor = (x0.shape[1] + fg_mask.shape[1] - 1) // fg_mask.shape[1]
+                fg_mask = fg_mask.repeat(1, repeat_factor, 1, 1)[:, : x0.shape[1], :, :]
+
+        # 夹到合理范围，避免传入了过小的 background_weight 把背景梯度压没
+        bg_w = float(max(background_weight, 0.25))
+        weights = bg_w + (1.0 - bg_w) * fg_mask  # 背景=bg_w, 前景=1.0
+
+        # 关键修复：用全局加权平均，而不是每样本先归一化再求 mean。
+        # 原实现每个样本按 weights.sum() 归一，导致 batch 内不同样本权重不可比，
+        # 并且让整批损失的绝对尺度与 MSE 脱节（等价于忽略了前景占比差异）。
+        loss = (diff * weights).sum() / weights.sum().clamp_min(1e-6)
         return loss
 
     @torch.no_grad()
@@ -437,7 +476,7 @@ def train_ddpm(config, model, dataloader, epochs=100, lr=2e-4,
         if (epoch + 1) % 5 == 0:
             ddpm.eval()
             with torch.no_grad():
-                samples = ema_model.sample(sample_shape=(16, 3, 32, 32), progress_bar=False)
+                samples = ema_model.sample(sample_shape=(16, 3, 64, 64), progress_bar=False)
 
                 # 保存网格图像
                 grid = utils.make_grid(samples, nrow=4, padding=2, normalize=True)
@@ -521,8 +560,8 @@ def main():
 
     # 3. 准备数据（使用CIFAR10示例）
     transform = transforms.Compose([
-      transforms.Resize(32),
-      transforms.CenterCrop(32),
+      transforms.Resize(64),
+      transforms.CenterCrop(64),
       transforms.RandomHorizontalFlip(),
       transforms.ToTensor(),
       transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
@@ -579,8 +618,8 @@ def main():
     print("Generating final samples...")
     ema_model.eval()
     with torch.no_grad():
-        # 生成32个样本
-        final_samples = ema_model.sample(sample_shape=(32, 3, 32, 32))
+        # 生成64个样本
+        final_samples = ema_model.sample(sample_shape=(64, 3, 64, 64))
 
         # 保存最终样本网格
         grid = utils.make_grid(final_samples, nrow=8, padding=2, normalize=False)
@@ -620,7 +659,7 @@ def progressive_generation(model, config, timesteps_to_show=[0, 250, 500, 750, 9
             else ("cuda" if torch.cuda.is_available() else "cpu")
         )
     with torch.no_grad():
-        xt = torch.randn((1, 3, 32, 32), device=device)
+        xt = torch.randn((1, 3, 64, 64), device=device)
         samples_at_t = []
 
         for t in reversed(range(config.timesteps)):
