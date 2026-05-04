@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import yaml
 
-from data.dataset import FrontToBackDataset
+from data_code.dataset import FrontToBackDataset
 from models.diffusion import GaussianDiffusion
 from models.unet import UNet
 from utils.visualization import save_sample_grid

@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from data import repo_sparse_clone
+from data_code import repo_sparse_clone
 
 
 def test_prepare_sparse_paths_defaults_and_extra(tmp_path: Path):

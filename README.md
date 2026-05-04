@@ -19,10 +19,15 @@ This project implements two tasks:
 
 ```
 DL_project/
-├── data/
+├── data/                     # Runtime dataset storage (ignored by git)
+├── data_code/
 │   ├── spritesheet_utils.py   # LPC spritesheet parsing & pair extraction
 │   ├── augmentation.py        # Paired data augmentations
-│   └── dataset.py             # PyTorch Dataset classes (Task 1 & 2)
+│   ├── dataset.py             # PyTorch Dataset classes (Task 1 & 2)
+│   ├── repo_extractor.py      # Extract idle front/back views from LPC repo
+│   ├── repo_downloader.py     # Selective HTTP downloader / sparse clone helper
+│   ├── layer_stack.py         # Manual layer composition utility
+│   └── random_composer.py     # Randomised character composition tool
 ├── models/
 │   ├── unet.py                # Lightweight U-Net backbone with attention
 │   ├── diffusion.py           # DDPM / DDIM diffusion framework
@@ -60,7 +65,7 @@ A tiny demo dataset (32 random composites) is already bundled under `data/pairs/
 Place your LPC spritesheet PNG files in a directory (e.g. `data/raw_sprites/`), then extract front/back pairs:
 
 ```python
-from data.dataset import build_and_save_index
+from data_code.dataset import build_and_save_index
 
 pairs = build_and_save_index(
     sprite_dir="data/raw_sprites/",
@@ -72,7 +77,7 @@ pairs = build_and_save_index(
 If you already cloned the [Universal LPC Spritesheet Character Generator](https://github.com/LiberatedPixelCup/Universal-LPC-Spritesheet-Character-Generator), you can mirror its asset hierarchy into paired idle views with:
 
 ```bash README.md
-python -m data.repo_extractor \
+python -m data_code.repo_extractor \
     --repo-root /path/to/Universal-LPC-Spritesheet-Character-Generator \
     --out-dir data/pairs/lpc_repo \
     --index data/index_lpc_repo.csv \
@@ -84,7 +89,7 @@ This script preserves the upstream directory layout under `data/pairs` and produ
 > **Tip – download only what you need.** Instead of cloning the entire Universal LPC repository, perform a sparse clone that keeps only the sprite directories:
 >
 > ```bash README.md
-> python -m data.repo_sparse_clone \
+> python -m data_code.repo_sparse_clone \
 >     --dest data/raw_lpc_repo \
 >     --depth 1 \
 >     --force
@@ -92,12 +97,12 @@ This script preserves the upstream directory layout under `data/pairs` and produ
 >
 > 这会使用 `git --sparse` 只拉取 `spritesheets/**` 中默认的核心目录；若需要额外子目录，可追加 `--path spritesheets/...` 或准备一个列表文件并通过 `--paths-file` 传入。
 >
-> 如果你无法使用 git 或网络受限，也可以继续使用 `data.repo_downloader`（基于 HTTP 下载单个文件），但需要配置 `--token`/`--use-tree` 以避免 GitHub API 速率限制。
+> 如果你无法使用 git 或网络受限，也可以继续使用 `data_code.repo_downloader`（基于 HTTP 下载单个文件），但需要配置 `--token`/`--use-tree` 以避免 GitHub API 速率限制。
 >
 > 下载完成后，使用 `repo_extractor` 从稀疏克隆中抽取正/背面：
 >
 > ```bash README.md
-> python -m data.repo_extractor \
+> python -m data_code.repo_extractor \
 >     --repo-root data/raw_lpc_repo \
 >     --out-dir data/pairs/lpc_repo \
 >     --index data/index_lpc_repo.csv \
@@ -106,10 +111,10 @@ This script preserves the upstream directory layout under `data/pairs` and produ
 >
 > 这一步会在 `data/pairs/lpc_repo/` 下生成前后视图 PNG，并写出可直接喂入 `SpritePairDataset` 的索引。
 
-To compose a **complete character** from the layers you downloaded (body, head, outfit, etc.), use `data.layer_stack`:
+To compose a **complete character** from the layers you downloaded (body, head, outfit, etc.), use `data_code.layer_stack`:
 
 ```bash README.md
-python -m data.layer_stack \
+python -m data_code.layer_stack \
     --assets-root data/raw_lpc_subset \
     --out-dir data/pairs/custom \
     --name hero01 \
@@ -128,10 +133,10 @@ layers:
 ```
 
 Layer order matters (bottom-most first). Inspect the downloaded directory (or the site's JSON export) to choose the exact paths you need. You can also pass repeated `--layer` flags instead of a file.
-不想手写清单？`data.random_composer` 可以在本地素材中随机抽取层组合，直接生成多组完整人物：
+不想手写清单？`data_code.random_composer` 可以在本地素材中随机抽取层组合，直接生成多组完整人物：
 
 ```bash README.md
-python -m data.random_composer \
+python -m data_code.random_composer \
     --assets-root data/raw_lpc_repo \
     --out-dir data/pairs/random_batch \
     --count 32 \
@@ -140,7 +145,7 @@ python -m data.random_composer \
     --palette-shift-prob 0.8  # 强烈推荐：随机调色，生成更多彩的衣物/饰品
 ```
 
-默认会尝试组合 `body → legs → torso → head → hair → feet` 六大类，如果某类素材缺失则自动跳过；你也可以通过 `--groups body head torso` 指定需要的层。调色幅度可通过 `--palette-hue/--palette-saturation/--palette-value` 控制，若想保持原色，把 `--palette-shift-prob` 设为 `0` 即可。
+默认会尝试组合 `body → legs → torso → head → hair → feet` 六大类，如果某类素材缺失则自动跳过；你也可以通过 `--groups body head torso` 指定需要的层。调色幅度可通过 `--palette-h/--palette-s/--palette-v` 控制，若想保持原色，把 `--palette-shift-prob` 设为 `0` 即可。
 
 The extractor reads the **idle frame** (column 0) from the standard LPC rows:
 - Row 2 → **front view** (walk-down direction)

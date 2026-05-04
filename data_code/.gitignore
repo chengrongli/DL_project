@@ -1,0 +1,2 @@
+# keep Python sources under version control
+!.gitignore

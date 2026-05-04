@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import yaml
 
-from data.dataset import SpritePairDataset
+from data_code.dataset import SpritePairDataset
 from models.diffusion import GaussianDiffusion
 from models.embeddings import build_lpc_attr_embedding
 from models.unet import UNet

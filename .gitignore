@@ -34,4 +34,7 @@ runs/
 # Misc
 .DS_Store
 *.log
+
+# Data directory (code moved to data_code/)
 data/
+!data/.gitignore

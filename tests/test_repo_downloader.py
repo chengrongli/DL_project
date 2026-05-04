@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from data import repo_downloader
+from data_code import repo_downloader
 
 
 class MockResponse:

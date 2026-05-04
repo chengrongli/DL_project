@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from data.random_composer import random_compose_batch
+from data_code.random_composer import random_compose_batch
 
 TILE = 64
 

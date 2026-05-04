@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from data.layer_stack import compose_character
+from data_code.layer_stack import compose_character
 
 TILE = 64
 

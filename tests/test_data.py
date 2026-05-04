@@ -14,7 +14,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from data.spritesheet_utils import (
+from data_code.spritesheet_utils import (
     TILE_W,
     TILE_H,
     ROW_WALK_DOWN,
@@ -25,15 +25,15 @@ from data.spritesheet_utils import (
     save_pair,
     build_pair_dataset,
 )
-from data.augmentation import (
+from data_code.augmentation import (
     random_horizontal_flip,
     random_color_jitter,
     random_palette_shift,
     random_occlusion,
     to_tensor_pair,
 )
-from data.dataset import SpritePairDataset, FrontToBackDataset, _write_index
-from data.repo_extractor import extract_pairs_from_repo
+from data_code.dataset import SpritePairDataset, FrontToBackDataset, _write_index
+from data_code.repo_extractor import extract_pairs_from_repo
 
 
 # ---------------------------------------------------------------------------
