@@ -1,299 +1,199 @@
-# DL Project – Controllable Pixel Character Generator
+# DL Project – Diffusion-Based LPC Character Generator
 
-A controllable pixel-art character generator built on **LPC (Universal LPC Spritesheet Character Generator)** assets and **diffusion-based generative models**.
-
----
-
-## Overview
-
-This project implements two tasks:
+Pixel-art character generation on **Liberated Pixel Cup (LPC)** assets, powered by diffusion models. The repository contains data extraction utilities, training/inference pipelines, and evaluation helpers for two related tasks:
 
 | Task | Description |
 |------|-------------|
-| **Task 1** | Random generation of a character's **front view and back view** jointly (conditional diffusion) |
-| **Task 2** | Given a **front view image**, generate the corresponding **back view** (image-to-image diffusion) |
+| **Task 1** | Generate a **front/back pair** jointly from noise (6-channel output). Now trained via the shared `ddpm.py` framework. |
+| **Task 2** | Given a **front view**, diffuse the corresponding **back view** (image-to-image). |
 
 ---
 
-## Architecture
+## Repository layout
 
 ```
 DL_project/
-├── data/                     # Runtime dataset storage (ignored by git)
-├── data_code/
-│   ├── spritesheet_utils.py   # LPC spritesheet parsing & pair extraction
-│   ├── augmentation.py        # Paired data augmentations
-│   ├── dataset.py             # PyTorch Dataset classes (Task 1 & 2)
-│   ├── repo_extractor.py      # Extract idle front/back views from LPC repo
-│   ├── repo_downloader.py     # Selective HTTP downloader / sparse clone helper
-│   ├── layer_stack.py         # Manual layer composition utility
-│   └── random_composer.py     # Randomised character composition tool
-├── models/
-│   ├── unet.py                # Lightweight U-Net backbone with attention
-│   ├── diffusion.py           # DDPM / DDIM diffusion framework
-│   └── embeddings.py          # Attribute embeddings & CFG null token
-├── train/
-│   ├── train_task1.py         # Task 1 training script
-│   └── train_task2.py         # Task 2 training script
-├── inference/
-│   ├── generate.py            # Random pair generation (Task 1)
-│   └── reconstruct.py         # Front-to-back reconstruction (Task 2)
-├── utils/
-│   ├── visualization.py       # Grid/side-by-side image utilities
-│   └── metrics.py             # MSE, PSNR, SSIM, histogram distance
+├── ddpm.py                  # General-purpose DDPM config/UNet/training utilities
 ├── configs/
-│   ├── task1_config.yaml      # Training config for Task 1
-│   └── task2_config.yaml      # Training config for Task 2
-├── tests/                     # Unit tests
+│   ├── task1_config.yaml    # Training configuration (Task 1)
+│   └── task2_config.yaml    # Training configuration (Task 2)
+├── data_code/               # Dataset builders and augmentation utilities
+│   ├── dataset.py           # SpritePairDataset & FrontToBackDataset
+│   ├── augmentation.py      # Paired sprite augmentations
+│   ├── spritesheet_utils.py # LPC asset parsing helpers
+│   ├── repo_extractor.py    # Extract front/back pairs from LPC repos
+│   ├── repo_downloader.py   # HTTP downloader / sparse clone helper
+│   ├── layer_stack.py       # Manual layer composition
+│   └── random_composer.py   # Random layered sprite composer
+├── train/
+│   ├── train_task1.py       # Task 1 training (uses ddpm.py components)
+│   └── train_task2.py       # Task 2 training (legacy diffusion stack)
+├── inference/
+│   ├── generate.py          # Task 1 sampling
+│   └── reconstruct.py       # Task 2 reconstruction demo
+├── models/                  # Legacy diffusion implementation (Task 2)
+├── utils/                   # Visualisation & metric helpers
+├── tests/                   # Unit tests
 └── requirements.txt
 ```
 
+Task 1 has been migrated to the standalone `ddpm.py` implementation so it can be reused across experiments; Task 2 still depends on the original `models/` modules.
+
 ---
 
-## Setup
+## Environment setup
 
-### 1. Install dependencies
+1. **Install requirements**
 
-```bash
-pip install -r requirements.txt
-```
+    ```bash README.md
+    pip install -r requirements.txt
+    ```
 
-### 2. Prepare data
+2. **(Optional) Create a conda env**
 
-A tiny demo dataset (32 random composites) is already bundled under `data/pairs/random_batch/`. Task 1 now defaults to the much larger `data/pairs/all/` corpus so the model sees a richly varied colour palette; switch the config back to `random_batch` only when you need a very quick smoke test. For meaningful training runs you should still build your own split, as described below.
+    ```bash README.md
+    conda env create -f environment.yml
+    conda activate dl-pixel
+    ```
 
-Place your LPC spritesheet PNG files in a directory (e.g. `data/raw_sprites/`), then extract front/back pairs:
+---
 
-```python
-from data_code.dataset import build_and_save_index
+## Data preparation
 
-pairs = build_and_save_index(
-    sprite_dir="data/raw_sprites/",
-    out_dir="data/pairs/train/",
-    index_path="data/index_train.csv",
-)
-```
+A lightweight demo split (32 random composites) lives in `data/pairs/random_batch/`. For proper training use the full asset extraction or compose your own dataset.
 
-If you already cloned the [Universal LPC Spritesheet Character Generator](https://github.com/LiberatedPixelCup/Universal-LPC-Spritesheet-Character-Generator), you can mirror its asset hierarchy into paired idle views with:
+1. **Collect LPC assets** (clone or download the [Universal LPC repository](https://github.com/LiberatedPixelCup/Universal-LPC-Spritesheet-Character-Generator)).
+2. **Extract front/back pairs** using the helper below; the extractor reads the idle frame (column 0) with rows `walk_down` (front) and `walk_up` (back).
 
-```bash README.md
-python -m data_code.repo_extractor \
-    --repo-root /path/to/Universal-LPC-Spritesheet-Character-Generator \
-    --out-dir data/pairs/lpc_repo \
-    --index data/index_lpc_repo.csv \
-    --patterns "*walk.png"
-```
+    ```bash README.md
+    python -m data_code.repo_extractor \
+        --repo-root /path/to/Universal-LPC-Spritesheet-Character-Generator \
+        --out-dir data/pairs/all \
+        --index   data/index_all.csv \
+        --patterns "*walk.png"
+    ```
 
-This script preserves the upstream directory layout under `data/pairs` and produces a CSV index that can be fed directly into `SpritePairDataset`.
+3. **Compose characters manually** (optional). Layer ordered sprites with `layer_stack`:
 
-> **Tip – download only what you need.** Instead of cloning the entire Universal LPC repository, perform a sparse clone that keeps only the sprite directories:
->
-> ```bash README.md
-> python -m data_code.repo_sparse_clone \
->     --dest data/raw_lpc_repo \
->     --depth 1 \
->     --force
-> ```
->
-> 这会使用 `git --sparse` 只拉取 `spritesheets/**` 中默认的核心目录；若需要额外子目录，可追加 `--path spritesheets/...` 或准备一个列表文件并通过 `--paths-file` 传入。
->
-> 如果你无法使用 git 或网络受限，也可以继续使用 `data_code.repo_downloader`（基于 HTTP 下载单个文件），但需要配置 `--token`/`--use-tree` 以避免 GitHub API 速率限制。
->
-> 下载完成后，使用 `repo_extractor` 从稀疏克隆中抽取正/背面：
->
-> ```bash README.md
-> python -m data_code.repo_extractor \
->     --repo-root data/raw_lpc_repo \
->     --out-dir data/pairs/lpc_repo \
->     --index data/index_lpc_repo.csv \
->     --patterns "*walk.png"
-> ```
->
-> 这一步会在 `data/pairs/lpc_repo/` 下生成前后视图 PNG，并写出可直接喂入 `SpritePairDataset` 的索引。
+    ```bash README.md
+    python -m data_code.layer_stack \
+        --assets-root data/raw_assets \
+        --out-dir data/pairs/custom \
+        --name hero01 \
+        --layers-file configs/hero01_layers.yaml
+    ```
 
-To compose a **complete character** from the layers you downloaded (body, head, outfit, etc.), use `data_code.layer_stack`:
+4. **Generate random composites** (optional) to widen palette diversity:
 
-```bash README.md
-python -m data_code.layer_stack \
-    --assets-root data/raw_lpc_subset \
-    --out-dir data/pairs/custom \
-    --name hero01 \
-    --layers-file configs/hero01_layers.yaml
-```
+    ```bash README.md
+    python -m data_code.random_composer \
+        --assets-root data/raw_assets \
+        --out-dir data/pairs/random_batch \
+        --count 64 \
+        --seed 123 \
+        --palette-shift-prob 0.8
+    ```
 
-A simple YAML file can look like:
-
-```yaml README.md
-layers:
-  - spritesheets/body/bodies/male/walk.png                # base body
-  - spritesheets/head/.../walk.png                         # replace with head layer
-  - spritesheets/torso/.../walk.png                        # outfit / armor
-  - spritesheets/legs/.../walk.png                         # pants / legs
-  - spritesheets/hair/.../walk.png                         # optional hair, etc.
-```
-
-Layer order matters (bottom-most first). Inspect the downloaded directory (or the site's JSON export) to choose the exact paths you need. You can also pass repeated `--layer` flags instead of a file.
-不想手写清单？`data_code.random_composer` 可以在本地素材中随机抽取层组合，直接生成多组完整人物：
-
-```bash README.md
-python -m data_code.random_composer \
-    --assets-root data/raw_lpc_repo \
-    --out-dir data/pairs/random_batch \
-    --count 32 \
-    --seed 42 \
-    --prefix rand \
-    --palette-shift-prob 0.8  # 强烈推荐：随机调色，生成更多彩的衣物/饰品
-```
-
-默认会尝试组合 `body → legs → torso → head → hair → feet` 六大类，如果某类素材缺失则自动跳过；你也可以通过 `--groups body head torso` 指定需要的层。调色幅度可通过 `--palette-h/--palette-s/--palette-v` 控制，若想保持原色，把 `--palette-shift-prob` 设为 `0` 即可。
-
-The extractor reads the **idle frame** (column 0) from the standard LPC rows:
-- Row 2 → **front view** (walk-down direction)
-- Row 0 → **back view**  (walk-up direction)
+All scripts emit `(front.png, back.png)` pairs compatible with `SpritePairDataset`. You can also call `data_code.dataset.build_and_save_index(...)` directly from Python to build CSV indices.
 
 ---
 
 ## Training
 
-### Task 1 – Random Front+Back Generation
+### Task 1 – Joint front/back generation (DDPM)
 
-```bash
+The new pipeline wraps `ddpm.DiffusionConfig`, `ddpm.UNet`, and `ddpm.DDPM`.
+
+```bash README.md
 python train/train_task1.py --config configs/task1_config.yaml
 ```
 
-Key settings in `configs/task1_config.yaml`:
+Highlights from `configs/task1_config.yaml`:
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `model.in_channels` | 6 | Front(3) + Back(3) concatenated |
-| `model.out_channels` | 6 | Predict noise for both views |
-| `model.cond_emb_dim` | 256 | Attribute embedding size (0 = disabled) |
-| `diffusion.timesteps` | 1000 | Diffusion steps |
-| `diffusion.schedule` | `cosine` | Beta schedule |
-| `training.p_uncond` | 0.1 | CFG null-drop probability |
+| Key | Meaning |
+|-----|---------|
+| `model.in_channels=6` | Concatenated front/back RGB channels |
+| `model.model_channels=64` | Base width (UNet depth adjusts via `channel_mults`) |
+| `diffusion.timesteps=1000` | Linear schedule from `ddpm.py` (β₀=1e-4 → β_T=2e-2) |
+| `training.batch_size=64` | Increase if memory allows; script auto-detects CUDA/MPS |
+| `training.ema_decay=0.9999` | EMA applied every iteration to a shadow DDPM model |
+| `training.sample_every=10` | Saves EMA samples (clamped to [-1,1]) to `outputs/task1/samples/` |
 
-### Task 2 – Front-to-Back Reconstruction
+The script supports `--resume` checkpoints produced by the new DDPM loop. Logs are written to `outputs/task1/logs/` (TensorBoard compatible).
 
-```bash
+### Task 2 – Front-to-back diffusion (legacy)
+
+Task 2 still runs on the original diffusion stack under `models/`:
+
+```bash README.md
 python train/train_task2.py --config configs/task2_config.yaml
 ```
 
-Key settings in `configs/task2_config.yaml`:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `model.in_channels` | 6 | Noisy back(3) + front condition(3) |
-| `model.out_channels` | 3 | Predict back noise only |
-| `data.occlusion_p` | 0.3 | Random occlusion augmentation probability |
-| `training.use_discriminator` | false | Enable PatchGAN adversarial fine-tuning |
+Its configuration retains classifier-free guidance embeddings and optional PatchGAN fine-tuning. Once Task 1 stabilises with `ddpm.py`, the same refactor can be applied here.
 
 ---
 
-## Inference
+## Inference & sampling
 
-### Task 1 – Random generation
+### Task 1 sampling
 
-```bash
+```bash README.md
 python inference/generate.py \
     --config configs/task1_config.yaml \
-    --ckpt   outputs/task1/checkpoints/ckpt_epoch0099.pth \
+    --ckpt   outputs/task1/checkpoints/ddpm_epoch0100.pth \
     --n      8 \
     --steps  50 \
-    --scale  3.0 \
-    --out    outputs/task1/generated/
+    --scale  2.5 \
+    --out    outputs/task1/generated
 ```
 
-Options:
-- `--n`: number of pairs to generate
-- `--steps`: DDIM denoising steps (fewer = faster, default 50)
-- `--scale`: classifier-free guidance scale (1.0 = no guidance)
-- `--eta`: DDIM stochasticity (0 = deterministic)
+- `--steps` runs DDIM sampling; use ≤100 for quick previews.
+- `--scale` controls classifier-free guidance (1.0 disables it). The script automatically uses the EMA weights when present in the checkpoint.
 
-### Task 2 – Front-to-back reconstruction
+### Task 2 reconstruction
 
-```bash
-# Single image
+```bash README.md
 python inference/reconstruct.py \
     --config configs/task2_config.yaml \
     --ckpt   outputs/task2/checkpoints/ckpt_epoch0099.pth \
-    --input  path/to/front.png \
+    --input  samples/front.png \
     --steps  50 \
-    --out    outputs/task2/reconstructed/
-
-# Batch mode (all PNGs in a directory)
-python inference/reconstruct.py \
-    --config configs/task2_config.yaml \
-    --ckpt   outputs/task2/checkpoints/ckpt_epoch0099.pth \
-    --input  path/to/front_images/ \
-    --out    outputs/task2/reconstructed/
+    --out    outputs/task2/reconstructed
 ```
+
+Pass a directory to `--input` for batch processing. Optional `--compare` flag saves side-by-side grids with ground truth when available.
 
 ---
 
 ## Evaluation
 
-```python
+Quantitative metrics (MSE, PSNR, SSIM, palette histograms) live under `utils/metrics.py`.
+
+```python README.md
 from utils.metrics import evaluate_pair_batch
 
-results = evaluate_pair_batch(fronts, pred_backs, gt_backs)
-# {
-#   "mse":             0.0031,
-#   "psnr":            25.1,
-#   "ssim":            0.87,
-#   "hist_pred_front": 0.12,   # palette consistency
-#   "hist_pred_gt":    0.08,
-# }
+metrics = evaluate_pair_batch(fronts, backs_pred, backs_gt)
+print(metrics)
+# {'mse': 3.2e-3, 'psnr': 25.0, 'ssim': 0.86, 'hist_pred_front': 0.11, ...}
 ```
 
----
-
-## Model Details
-
-### U-Net backbone (`models/unet.py`)
-
-- **Encoder**: `n_levels` DownBlocks, each with `n_res_blocks` ResBlocks + stride-2 downsampling.
-- **Middle**: ResBlock → Self-Attention → ResBlock.
-- **Decoder**: UpBlocks with bilinear upsampling + skip connections.
-- **Conditioning**: sinusoidal timestep embedding + optional attribute embedding (added via scale-shift).
-- **Attention**: multi-head spatial self-attention at low-resolution feature maps (configurable via `attn_resolutions`).
-
-### Diffusion framework (`models/diffusion.py`)
-
-- **Forward process**: `q(x_t | x_0) = N(sqrt(a_t) * x_0, (1-a_t)*I)` with cosine schedule.
-- **Reverse process**: predict noise with U-Net, compute posterior mean (DDPM), or use DDIM.
-- **DDIM sampling**: deterministic (eta=0) or stochastic (eta>0), ~50 NFE for good quality.
-- **Classifier-Free Guidance**: `noise* = noise_unc + s*(noise_cond - noise_unc)`.
-
-### Attribute embeddings (`models/embeddings.py`)
-
-- Default LPC vocabulary: body, hair, hat, outfit, legs, shoes, weapon, shield.
-- CFG null embedding: with probability `p_uncond`, all attributes are replaced by a learned null vector during training.
+Combine these with qualitative grids from `utils.visualization.save_sample_grid` for tracking progress.
 
 ---
 
-## Running Tests
+## Troubleshooting & tips
 
-```bash
-python -m pytest tests/ -v
-```
-
-All tests run on CPU without requiring data or a trained checkpoint.
-
----
-
-## Cloud Training Tips
-
-1. **Use `mixed_precision: true`** in the config (requires CUDA) for ~2x throughput.
-2. **Increase `batch_size`** (64-128) on multi-GPU machines; use `torch.nn.DataParallel` or HuggingFace `accelerate` for multi-GPU.
-3. **Start with Task 1** to validate the data pipeline; Task 2 requires the same data so no extra preprocessing is needed.
-4. **Checkpoints** are saved every `save_every` epochs; resume training with `--resume path/to/ckpt.pth`.
-5. **TensorBoard** logs are written to `{out_dir}/logs/`; run `tensorboard --logdir outputs/` to monitor.
+1. **Data sanity** – ensure every front has a matching back. `SpritePairDataset` raises if pairs are missing.
+2. **Mixed precision** – enable via `training.mixed_precision: true` (CUDA only) to double throughput.
+3. **Memory** – reduce `batch_size` or UNet width (`model_channels`) on smaller GPUs; the DDPM UNet uses GroupNorm, so per-batch statistics remain stable.
+4. **EMA checkpoints** – inference scripts prefer EMA weights; if absent, they fall back to raw weights.
+5. **TensorBoard** – launch `tensorboard --logdir outputs/` for live loss curves and sample previews.
 
 ---
 
 ## References
 
-- Ho et al., [Denoising Diffusion Probabilistic Models](https://arxiv.org/abs/2006.11239) (2020)
-- Song et al., [Denoising Diffusion Implicit Models](https://arxiv.org/abs/2010.02502) (2021)
-- Nichol & Dhariwal, [Improved Denoising Diffusion Probabilistic Models](https://arxiv.org/abs/2102.09672) (2021)
+- Ho et al., *Denoising Diffusion Probabilistic Models*, 2020.
+- Nichol & Dhariwal, *Improved Denoising Diffusion Probabilistic Models*, 2021.
+- Song et al., *Denoising Diffusion Implicit Models*, 2021.
 - [Universal LPC Spritesheet Character Generator](https://sanderfrenken.github.io/Universal-LPC-Spritesheet-Character-Generator/)
