@@ -7,7 +7,7 @@ data:
   # Path to pre-extracted front/back pair images OR a CSV index.
   # Run `python data/dataset.py` (or build_and_save_index) first to populate.
   # For rich palette diversity, default to the full LPC asset extraction.
-  train_dir: "data/pairs/all"
+  train_dir: "data/pairs/random_batch"
   # Validation defaults to the lightweight bundle for quick sanity checks.
   val_dir:   "data/pairs/random_batch"
   image_size: 64
