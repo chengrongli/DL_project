@@ -1,0 +1,4 @@
+count 222
+human 198
+eyebrows 4
+cyclops 20

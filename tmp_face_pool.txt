@@ -1,0 +1,1 @@
+{'body': 8, 'legs': 774, 'feet': 891, 'torso': 1341, 'dress': 272, 'arms': 12, 'neck': 975, 'head': 10, 'eyes': 198, 'facial': 883, 'hair': 151, 'hat': 1783, 'shoulders': 27}

@@ -40,16 +40,31 @@ from data_code.augmentation import (
 def _load_index(index_path: str) -> List[Tuple[str, str]]:
     """
     Load a CSV index with columns [front_path, back_path].
-    Lines starting with '#' are skipped.
+    Lines starting with '#' and common header rows are skipped.
     """
     pairs: List[Tuple[str, str]] = []
     with open(index_path, "r", newline="") as f:
         reader = csv.reader(f)
         for row in reader:
-            if not row or row[0].startswith("#"):
+            if not row:
                 continue
+
+            c0 = row[0].strip()
+            if c0.startswith("#"):
+                continue
+
+            # 跳过表头：front_path,back_path 或 # front_path,back_path
+            c0_lower = c0.lower().lstrip("#").strip()
+            c1_lower = row[1].strip().lower() if len(row) > 1 else ""
+            if c0_lower in {"front_path", "front", "input_front"} and c1_lower in {
+                "back_path",
+                "back",
+                "input_back",
+            }:
+                continue
+
             if len(row) >= 2:
-                pairs.append((row[0].strip(), row[1].strip()))
+                pairs.append((c0, row[1].strip()))
     return pairs
 
 

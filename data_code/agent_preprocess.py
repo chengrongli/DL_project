@@ -57,25 +57,19 @@ def _write_index(path: Path, items: Sequence[Tuple[Path, Path]]) -> None:
             writer.writerow([str(front), str(back)])
 
 
-def preprocess_pairs(
-    input_dir: str,
-    output_dir: str,
+def _process_source(
+    source_dir: Path,
+    output_dir: Path,
     *,
-    image_size: int = 64,
-    val_ratio: float = 0.1,
-    seed: int = 42,
-    max_samples: int | None = None,
-    deduplicate: bool = True,
-) -> dict:
-    src_root = Path(input_dir).expanduser().resolve()
-    out_root = Path(output_dir).expanduser().resolve()
-
-    if not src_root.exists():
-        raise FileNotFoundError(f"Input dataset does not exist: {src_root}")
-
-    pairs = _scan_pairs(src_root)
+    image_size: int,
+    seed: int,
+    max_samples: int | None,
+    deduplicate: bool,
+    name_prefix: str,
+) -> tuple[List[Tuple[Path, Path]], int, int]:
+    pairs = _scan_pairs(source_dir)
     if not pairs:
-        raise RuntimeError(f"No *_front.png/*_back.png pairs found in: {src_root}")
+        raise RuntimeError(f"No *_front.png/*_back.png pairs found in: {source_dir}")
 
     if max_samples is not None:
         pairs = pairs[: max(0, max_samples)]
@@ -83,12 +77,11 @@ def preprocess_pairs(
     rng = random.Random(seed)
     rng.shuffle(pairs)
 
-    out_root.mkdir(parents=True, exist_ok=True)
     processed: List[Tuple[Path, Path]] = []
     seen_hash = set()
     dropped_duplicates = 0
 
-    for idx, rec in enumerate(pairs):
+    for rec in pairs:
         front = _load_resize_rgba(rec.front, image_size)
         back = _load_resize_rgba(rec.back, image_size)
 
@@ -99,37 +92,92 @@ def preprocess_pairs(
                 continue
             seen_hash.add(sig)
 
-        name = f"pair_{len(processed):06d}"
-        front_out = out_root / f"{name}_front.png"
-        back_out = out_root / f"{name}_back.png"
+        name = f"{name_prefix}_{len(processed):06d}"
+        front_out = output_dir / f"{name}_front.png"
+        back_out = output_dir / f"{name}_back.png"
         front.save(front_out)
         back.save(back_out)
         processed.append((front_out, back_out))
 
     if not processed:
-        raise RuntimeError("All samples were filtered out during preprocessing.")
+        raise RuntimeError(f"All samples were filtered out for source: {source_dir}")
 
-    rng.shuffle(processed)
-    n_val = int(round(len(processed) * val_ratio))
-    n_val = min(max(n_val, 1), max(1, len(processed) - 1)) if len(processed) > 1 else 0
+    return processed, len(pairs), dropped_duplicates
 
-    val_items = processed[:n_val]
-    train_items = processed[n_val:]
 
-    _write_index(out_root / "index_all.csv", processed)
+def preprocess_pairs(
+    input_dir: str,
+    output_dir: str,
+    *,
+    val_input_dir: str | None = None,
+    image_size: int = 64,
+    val_ratio: float = 0.1,
+    seed: int = 42,
+    max_samples: int | None = None,
+    max_val_samples: int | None = None,
+    deduplicate: bool = True,
+) -> dict:
+    src_root = Path(input_dir).expanduser().resolve()
+    out_root = Path(output_dir).expanduser().resolve()
+
+    if not src_root.exists():
+        raise FileNotFoundError(f"Input dataset does not exist: {src_root}")
+
+    val_root = Path(val_input_dir).expanduser().resolve() if val_input_dir else None
+    if val_root is not None and not val_root.exists():
+        raise FileNotFoundError(f"Validation dataset does not exist: {val_root}")
+
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    train_items, train_input_pairs, train_dropped_duplicates = _process_source(
+        source_dir=src_root,
+        output_dir=out_root,
+        image_size=image_size,
+        seed=seed,
+        max_samples=max_samples,
+        deduplicate=deduplicate,
+        name_prefix="train",
+    )
+
+    if val_root is not None:
+        val_items, val_input_pairs, val_dropped_duplicates = _process_source(
+            source_dir=val_root,
+            output_dir=out_root,
+            image_size=image_size,
+            seed=seed + 10007,
+            max_samples=max_val_samples,
+            deduplicate=deduplicate,
+            name_prefix="val",
+        )
+    else:
+        rng = random.Random(seed)
+        rng.shuffle(train_items)
+        n_val = int(round(len(train_items) * val_ratio))
+        n_val = min(max(n_val, 1), max(1, len(train_items) - 1)) if len(train_items) > 1 else 0
+        val_items = train_items[:n_val]
+        train_items = train_items[n_val:]
+        val_input_pairs = n_val
+        val_dropped_duplicates = 0
+
+    all_items = [*train_items, *val_items]
+
+    _write_index(out_root / "index_all.csv", all_items)
     _write_index(out_root / "index_train.csv", train_items)
     _write_index(out_root / "index_val.csv", val_items)
 
     stats = {
         "input_dir": str(src_root),
+        "val_input_dir": str(val_root) if val_root is not None else None,
         "output_dir": str(out_root),
-        "input_pairs": len(pairs),
-        "processed_pairs": len(processed),
-        "dropped_duplicates": dropped_duplicates,
+        "train_input_pairs": train_input_pairs,
+        "val_input_pairs": val_input_pairs,
+        "processed_pairs": len(all_items),
+        "train_dropped_duplicates": train_dropped_duplicates,
+        "val_dropped_duplicates": val_dropped_duplicates,
         "image_size": image_size,
         "train_pairs": len(train_items),
         "val_pairs": len(val_items),
-        "val_ratio": val_ratio,
+        "val_ratio": val_ratio if val_root is None else None,
         "seed": seed,
     }
 
@@ -142,10 +190,13 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Preprocess LPC front/back pair dataset")
     parser.add_argument("--input-dir", required=True, help="Directory containing raw *_front.png/*_back.png")
     parser.add_argument("--output-dir", required=True, help="Directory to write processed data")
+    parser.add_argument("--val-input-dir", help="Optional separate validation directory")
     parser.add_argument("--image-size", type=int, default=64)
-    parser.add_argument("--val-ratio", type=float, default=0.1)
+    parser.add_argument("--val-ratio", type=float, default=0.1,
+                        help="Used only when --val-input-dir is not provided")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-samples", type=int)
+    parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--no-deduplicate", action="store_true")
     return parser.parse_args()
 
@@ -155,10 +206,12 @@ def main() -> int:
     stats = preprocess_pairs(
         input_dir=args.input_dir,
         output_dir=args.output_dir,
+        val_input_dir=args.val_input_dir,
         image_size=args.image_size,
         val_ratio=args.val_ratio,
         seed=args.seed,
         max_samples=args.max_samples,
+        max_val_samples=args.max_val_samples,
         deduplicate=not args.no_deduplicate,
     )
     print(json.dumps(stats, ensure_ascii=False, indent=2))

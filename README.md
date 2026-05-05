@@ -96,9 +96,10 @@ A lightweight demo split (32 random composites) lives in `data/pairs/random_batc
         --report-only
     ```
 
-    If `body` candidates are too few, generation diversity will be bottlenecked.
+    The composer now uses `walk.png` **and** `walk/*.png` variants, while filtering
+    wound/prosthesis-like paths, to better match the official random generator style.
 
-5. **Generate random composites**:
+5. **Generate random composites** (website-like clean characters):
 
     ```bash README.md
     python -m data_code.random_composer \
@@ -106,19 +107,24 @@ A lightweight demo split (32 random composites) lives in `data/pairs/random_batc
         --out-dir data/pairs/random_batch \
         --count 4096 \
         --seed 123 \
-        --palette-shift-prob 0.8
+        --palette-shift-prob 0.8 \
+        --num-workers 8
     ```
 
-6. **Agent preprocess dataset** (split + dedup + index):
+6. **Agent preprocess dataset** (dedup + index):
+
+    If you already have a dedicated validation folder (e.g. `data/pairs/val`):
 
     ```bash README.md
     python -m data_code.agent_preprocess \
         --input-dir data/pairs/random_batch \
+        --val-input-dir data/pairs/val \
         --output-dir data/processed/task1 \
         --image-size 64 \
-        --val-ratio 0.1 \
         --seed 42
     ```
+
+    If you don't have a separate validation set, omit `--val-input-dir` and use `--val-ratio` split.
 
 7. **Visualize preprocessed data**:
 

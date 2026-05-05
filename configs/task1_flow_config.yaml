@@ -21,8 +21,8 @@ flow:
 
 training:
   device: "auto"
-  epochs: 400
-  batch_size: 32
+  epochs: 200
+  batch_size: 128
   num_workers: 4
   lr: 1.0e-4
   lr_min: 1.0e-6
@@ -33,9 +33,9 @@ training:
   foreground_weight: 6.0
   alpha_weight: 0.8
 
-  val_every: 5
-  save_every: 25
-  sample_every: 10
+  val_every: 25
+  save_every: 50
+  sample_every: 50
   sample_count: 16
 
   out_dir: "outputs/task1_flow"
