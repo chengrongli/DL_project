@@ -4,7 +4,7 @@ Pixel-art character generation on **Liberated Pixel Cup (LPC)** assets, powered 
 
 | Task | Description |
 |------|-------------|
-| **Task 1** | Generate a **front/back pair** jointly from noise (6-channel output). Now trained via the shared `ddpm.py` framework. |
+| **Task 1** | Generate a **front/back pair** jointly from noise (RGBA horizontal pair). Supports both DDPM and **Flow Matching**. |
 | **Task 2** | Given a **front view**, diffuse the corresponding **back view** (image-to-image). |
 
 ---
@@ -15,8 +15,9 @@ Pixel-art character generation on **Liberated Pixel Cup (LPC)** assets, powered 
 DL_project/
 ├── ddpm.py                  # General-purpose DDPM config/UNet/training utilities
 ├── configs/
-│   ├── task1_config.yaml    # Training configuration (Task 1)
-│   └── task2_config.yaml    # Training configuration (Task 2)
+│   ├── task1_config.yaml      # Task 1 DDPM training config
+│   ├── task1_flow_config.yaml # Task 1 Flow Matching config
+│   └── task2_config.yaml      # Task 2 training configuration
 ├── data_code/               # Dataset builders and augmentation utilities
 │   ├── dataset.py           # SpritePairDataset & FrontToBackDataset
 │   ├── augmentation.py      # Paired sprite augmentations
@@ -24,12 +25,15 @@ DL_project/
 │   ├── repo_extractor.py    # Extract front/back pairs from LPC repos
 │   ├── repo_downloader.py   # HTTP downloader / sparse clone helper
 │   ├── layer_stack.py       # Manual layer composition
-│   └── random_composer.py   # Random layered sprite composer
+│   ├── random_composer.py   # Random layered sprite composer
+│   └── agent_preprocess.py  # Agent-style dataset preprocessing/splitting
 ├── train/
-│   ├── train_task1.py       # Task 1 training (uses ddpm.py components)
+│   ├── train_task1.py       # Task 1 training (DDPM)
+│   ├── train_task1_flow.py  # Task 1 training (Flow Matching)
 │   └── train_task2.py       # Task 2 training (legacy diffusion stack)
 ├── inference/
-│   ├── generate.py          # Task 1 sampling
+│   ├── generate.py          # Task 1 DDPM sampling
+│   ├── generate_flow.py     # Task 1 Flow Matching sampling
 │   └── reconstruct.py       # Task 2 reconstruction demo
 ├── models/                  # Legacy diffusion implementation (Task 2)
 ├── utils/                   # Visualisation & metric helpers
@@ -37,7 +41,7 @@ DL_project/
 └── requirements.txt
 ```
 
-Task 1 has been migrated to the standalone `ddpm.py` implementation so it can be reused across experiments; Task 2 still depends on the original `models/` modules.
+Task 1 supports two training routes now: DDPM (`train/train_task1.py`) and Flow Matching (`train/train_task1_flow.py`). Task 2 still depends on the original `models/` modules.
 
 ---
 
@@ -83,39 +87,76 @@ A lightweight demo split (32 random composites) lives in `data/pairs/random_batc
         --layers-file configs/hero01_layers.yaml
     ```
 
-4. **Generate random composites** (optional) to widen palette diversity:
+4. **Check random-data layer base size** (recommended before generation):
 
     ```bash README.md
     python -m data_code.random_composer \
-        --assets-root data/raw_assets \
+        --assets-root data/raw_lpc_repo \
         --out-dir data/pairs/random_batch \
-        --count 64 \
+        --report-only
+    ```
+
+    If `body` candidates are too few, generation diversity will be bottlenecked.
+
+5. **Generate random composites**:
+
+    ```bash README.md
+    python -m data_code.random_composer \
+        --assets-root data/raw_lpc_repo \
+        --out-dir data/pairs/random_batch \
+        --count 4096 \
         --seed 123 \
         --palette-shift-prob 0.8
     ```
 
-All scripts emit `(front.png, back.png)` pairs compatible with `SpritePairDataset`. You can also call `data_code.dataset.build_and_save_index(...)` directly from Python to build CSV indices.
+6. **Agent preprocess dataset** (split + dedup + index):
+
+    ```bash README.md
+    python -m data_code.agent_preprocess \
+        --input-dir data/pairs/random_batch \
+        --output-dir data/processed/task1 \
+        --image-size 64 \
+        --val-ratio 0.1 \
+        --seed 42
+    ```
+
+7. **Visualize preprocessed data**:
+
+    ```bash README.md
+    python -m utils.visualize_preprocessed \
+        --index data/processed/task1/index_train.csv \
+        --out outputs/data_preview/task1_train_grid.png \
+        --limit 36
+    ```
+
+All scripts emit `(front.png, back.png)` pairs compatible with `SpritePairDataset`.
 
 ---
 
 ## Training
 
-### Task 1 – Joint front/back generation (DDPM)
+### Task 1 – Joint front/back generation
 
-The new pipeline wraps `ddpm.DiffusionConfig`, `ddpm.UNet`, and `ddpm.DDPM`.
+#### Option A: DDPM
 
 ```bash README.md
 python train/train_task1.py --config configs/task1_config.yaml
 ```
 
-Highlights from `configs/task1_config.yaml`:
+#### Option B: Flow Matching
+
+```bash README.md
+python train/train_task1_flow.py --config configs/task1_flow_config.yaml
+```
+
+Highlights from `configs/task1_config.yaml` (DDPM):
 
 | Key | Meaning |
 |-----|---------|
-| `model.in_channels=6` | Concatenated front/back RGB channels |
+| `model.in_channels=4` | RGBA channels for a horizontally concatenated pair |
 | `model.model_channels=64` | Base width (UNet depth adjusts via `channel_mults`) |
 | `diffusion.timesteps=1000` | Linear schedule from `ddpm.py` (β₀=1e-4 → β_T=2e-2) |
-| `training.batch_size=64` | Increase if memory allows; script auto-detects CUDA/MPS |
+| `training.batch_size=32` | Increase if memory allows; script auto-detects CUDA/MPS |
 | `training.ema_decay=0.9999` | EMA applied every iteration to a shadow DDPM model |
 | `training.sample_every=10` | Saves EMA samples (clamped to [-1,1]) to `outputs/task1/samples/` |
 
@@ -137,6 +178,8 @@ Its configuration retains classifier-free guidance embeddings and optional Patch
 
 ### Task 1 sampling
 
+DDPM:
+
 ```bash README.md
 python inference/generate.py \
     --config configs/task1_config.yaml \
@@ -147,8 +190,16 @@ python inference/generate.py \
     --out    outputs/task1/generated
 ```
 
-- `--steps` runs DDIM sampling; use ≤100 for quick previews.
-- `--scale` controls classifier-free guidance (1.0 disables it). The script automatically uses the EMA weights when present in the checkpoint.
+Flow Matching:
+
+```bash README.md
+python inference/generate_flow.py \
+    --config configs/task1_flow_config.yaml \
+    --ckpt   outputs/task1_flow/checkpoints/flow_epoch0200.pth \
+    --n      16 \
+    --steps  60 \
+    --out    outputs/task1_flow/generated/samples.png
+```
 
 ### Task 2 reconstruction
 

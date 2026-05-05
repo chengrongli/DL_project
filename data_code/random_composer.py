@@ -13,7 +13,7 @@ import argparse
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from data_code.augmentation import random_palette_shift
 from data_code.spritesheet_utils import compose_layers, save_pair
@@ -29,13 +29,24 @@ DEFAULT_LAYER_ORDER: Sequence[str] = (
 )
 
 LAYER_PATTERNS: Dict[str, Sequence[str]] = {
-    "body": ("spritesheets/body/bodies/**/walk.png",),
+    # body 在 LPC 仓库中分布很分散，仅匹配 bodies/** 容易把基座限制得过小。
+    # 保留旧路径 + 全量兜底路径，提升结构多样性。
+    "body": (
+        "spritesheets/body/bodies/**/walk.png",
+        "spritesheets/body/**/walk.png",
+    ),
     "torso": ("spritesheets/torso/**/walk.png",),
     "legs": ("spritesheets/legs/**/walk.png",),
     "feet": ("spritesheets/feet/**/walk.png",),
-    "head": ("spritesheets/head/heads/**/walk.png",),
+    "head": (
+        "spritesheets/head/heads/**/walk.png",
+        "spritesheets/head/**/walk.png",
+    ),
     "hair": ("spritesheets/hair/**/walk.png",),
 }
+
+
+MAX_RESAMPLE_TRIES = 12
 
 
 @dataclass(frozen=True)
@@ -77,6 +88,14 @@ def _build_layer_pool(assets_root: Path, groups: Sequence[str]) -> Dict[str, Lis
     return pool
 
 
+def summarize_layer_pool(assets_root: str, groups: Sequence[str] = DEFAULT_LAYER_ORDER) -> Dict[str, int]:
+    root = Path(assets_root).expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"Assets root does not exist: {root}")
+    pool = _build_layer_pool(root, groups)
+    return {g: len(pool.get(g, [])) for g in groups}
+
+
 def random_compose_batch(
     assets_root: str,
     out_dir: str,
@@ -100,22 +119,46 @@ def random_compose_batch(
 
     if "body" not in layer_pool:
         raise RuntimeError(
-            "No body layers found. Ensure your assets include 'spritesheets/body/bodies/**/walk.png'."
+            "No body layers found. Ensure your assets include 'spritesheets/body/**/walk.png'."
         )
+
+    pool_summary = {g: len(layer_pool.get(g, [])) for g in groups}
+    summary_str = ", ".join(f"{k}={v}" for k, v in pool_summary.items())
+    print(f"[random_composer] layer pool summary: {summary_str}")
 
     selections: List[LayerChoice] = []
 
     out_path = Path(out_dir).expanduser().resolve()
     out_path.mkdir(parents=True, exist_ok=True)
 
+    used_signatures = set()
+
     for idx in range(count):
         chosen_layers: List[LayerChoice] = []
-        for group in groups:
-            candidates = layer_pool.get(group)
-            if not candidates:
-                continue
-            path = rng.choice(candidates)
-            chosen_layers.append(LayerChoice(group=group, path=path))
+        signature = None
+
+        # 尽量避免重复组合，提升有效多样性。
+        for _ in range(MAX_RESAMPLE_TRIES):
+            trial: List[LayerChoice] = []
+            for group in groups:
+                candidates = layer_pool.get(group)
+                if not candidates:
+                    continue
+                path = rng.choice(candidates)
+                trial.append(LayerChoice(group=group, path=path))
+
+            trial_sig = tuple(str(item.path) for item in trial)
+            if trial_sig not in used_signatures:
+                chosen_layers = trial
+                signature = trial_sig
+                break
+
+            # 如果实在抽不到新组合，接受重复，避免死循环。
+            chosen_layers = trial
+            signature = trial_sig
+
+        if signature is not None:
+            used_signatures.add(signature)
 
         layer_paths = [str(choice.path) for choice in chosen_layers]
         front, back = compose_layers(layer_paths, col=column)
@@ -159,12 +202,23 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         nargs="*",
         help="Layer groups to include (default order: body legs torso head hair feet)",
     )
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Only print available layer counts and exit",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parse_args(argv)
     groups = tuple(args.groups) if args.groups else DEFAULT_LAYER_ORDER
+    if args.report_only:
+        summary = summarize_layer_pool(args.assets_root, groups)
+        summary_str = ", ".join(f"{k}={v}" for k, v in summary.items())
+        print(f"[random_composer] {summary_str}")
+        return 0
+
     random_compose_batch(
         assets_root=args.assets_root,
         out_dir=args.out_dir,
