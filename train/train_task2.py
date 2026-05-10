@@ -162,6 +162,9 @@ def train_epoch(
     optimizer_d: optim.Optimizer = None,
     lambda_adv: float = 0.01,
     scaler=None,
+    fg_weight: float = 6.0,
+    bg_weight: float = 0.5,
+    color_weight: float = 1.0,
 ) -> dict:
     diffusion.train()
     if disc is not None:
@@ -173,19 +176,33 @@ def train_epoch(
     for batch in tqdm(loader, leave=False, desc="  train"):
         cond = batch["condition"].to(device)   # front image (B, 3, H, W)
         target = batch["target"].to(device)    # back image  (B, 3, H, W)
+        target_alpha = batch["target_alpha"].to(device)  # (B, 1, H, W)
         B = target.shape[0]
         n += 1
 
         t = torch.randint(0, diffusion.timesteps, (B,), device=device)
+
+        # Build front foreground mask from condition (non-black = foreground)
+        cond_fg = (cond.abs().sum(dim=1, keepdim=True) > 0.1).float()
 
         # --- Generator / diffusion step ---
         optimizer_g.zero_grad()
 
         if scaler is not None:
             with torch.cuda.amp.autocast():
-                loss_diff = diffusion.p_losses(target, t, cond_image=cond)
+                loss_diff = diffusion.p_losses(
+                    target, t, cond_image=cond,
+                    fg_mask=target_alpha, cond_fg_mask=cond_fg,
+                    fg_weight=fg_weight, bg_weight=bg_weight,
+                    color_weight=color_weight,
+                )
         else:
-            loss_diff = diffusion.p_losses(target, t, cond_image=cond)
+            loss_diff = diffusion.p_losses(
+                target, t, cond_image=cond,
+                fg_mask=target_alpha, cond_fg_mask=cond_fg,
+                fg_weight=fg_weight, bg_weight=bg_weight,
+                color_weight=color_weight,
+            )
 
         loss_g = loss_diff
 
@@ -329,12 +346,19 @@ def main() -> None:
 
     writer = SummaryWriter(log_dir=os.path.join(out_dir, "logs"))
 
+    fg_weight = cfg["training"].get("fg_weight", 6.0)
+    bg_weight = cfg["training"].get("bg_weight", 0.5)
+    color_weight = cfg["training"].get("color_weight", 1.0)
+
     for epoch in range(start_epoch, cfg["training"]["epochs"]):
         metrics = train_epoch(
             diffusion, train_loader, optimizer_g, device,
             disc=disc, optimizer_d=optimizer_d,
             lambda_adv=cfg["training"].get("lambda_adv", 0.01),
             scaler=scaler,
+            fg_weight=cfg["training"].get("fg_weight", 6.0),
+            bg_weight=cfg["training"].get("bg_weight", 0.5),
+            color_weight=cfg["training"].get("color_weight", 1.0),
         )
         scheduler.step()
 
@@ -355,9 +379,16 @@ def main() -> None:
                 for batch in val_loader:
                     cond = batch["condition"].to(device)
                     target = batch["target"].to(device)
+                    target_alpha = batch["target_alpha"].to(device)
+                    cond_fg = (cond.abs().sum(dim=1, keepdim=True) > 0.1).float()
                     B = target.shape[0]
                     t = torch.randint(0, diffusion.timesteps, (B,), device=device)
-                    val_loss += diffusion.p_losses(target, t, cond_image=cond).item()
+                    val_loss += diffusion.p_losses(
+                        target, t, cond_image=cond,
+                        fg_mask=target_alpha, cond_fg_mask=cond_fg,
+                        fg_weight=fg_weight, bg_weight=bg_weight,
+                        color_weight=color_weight,
+                    ).item()
             val_loss /= len(val_loader)
             writer.add_scalar("val/loss_diff", val_loss, epoch)
             print(f"  val_loss={val_loss:.5f}")

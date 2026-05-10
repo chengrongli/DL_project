@@ -74,11 +74,52 @@ def build_model(cfg: dict, device: torch.device, ckpt_path: str) -> GaussianDiff
 
 
 def preprocess(image_path: str, image_size: int) -> torch.Tensor:
-    """Load a front image and convert to a (1, 3, H, W) tensor in [−1, 1]."""
-    img = Image.open(image_path).convert("RGB").resize(
+    """Load a front image and convert to a (1, 3, H, W) tensor in [-1, 1].
+
+    Uses floodfill from corners to remove solid-color backgrounds,
+    then applies alpha premultiplication to match training data.
+    """
+    import numpy as np
+
+    img = Image.open(image_path).convert("RGBA").resize(
         (image_size, image_size), Image.NEAREST
     )
-    t = TF.to_tensor(img) * 2.0 - 1.0  # [−1, 1]
+    arr = np.array(img)
+
+    # Floodfill from 4 corners to find background
+    h, w = arr.shape[:2]
+    visited = np.zeros((h, w), dtype=bool)
+    bg_mask = np.zeros((h, w), dtype=bool)
+    threshold = 30  # color distance threshold
+
+    corners = [(0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1)]
+    for cy, cx in corners:
+        if visited[cy, cx]:
+            continue
+        seed_color = arr[cy, cx, :3].astype(np.float32)
+        stack = [(cy, cx)]
+        visited[cy, cx] = True
+        while stack:
+            y, x = stack.pop()
+            dist = np.abs(arr[y, x, :3].astype(np.float32) - seed_color).sum()
+            if dist > threshold * 3:
+                continue
+            bg_mask[y, x] = True
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    stack.append((ny, nx))
+
+    # Set background transparent
+    arr[bg_mask, 3] = 0
+
+    # Alpha premultiply
+    alpha = arr[:, :, 3:4].astype(np.float32) / 255.0
+    rgb = arr[:, :, :3].astype(np.float32) * alpha
+    rgb = np.clip(rgb, 0, 255)
+    out = np.concatenate([rgb, alpha * 255], axis=2).astype(np.uint8)
+    img = Image.fromarray(out).convert("RGB")
+    t = TF.to_tensor(img) * 2.0 - 1.0
     return t.unsqueeze(0)
 
 
