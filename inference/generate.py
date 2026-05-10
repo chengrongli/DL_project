@@ -18,6 +18,13 @@ Outputs:
 
 from __future__ import annotations
 
+# Backward-compatible alias: Task1 generation now uses Flow Matching only.
+if __name__ == "__main__":
+    from inference.generate_flow import main as _flow_main
+
+    _flow_main()
+    raise SystemExit(0)
+
 import argparse
 import os
 import sys

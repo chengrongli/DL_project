@@ -11,7 +11,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ddpm import UNet
+from models.flow_unet import UNet
 from models.flow_matching import FlowMatching
 from utils.visualization import save_sample_grid
 

@@ -1,2 +1,0 @@
-./ddpm.py
-./train/train_task1.py

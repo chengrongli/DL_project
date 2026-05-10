@@ -1,6 +1,0 @@
-count 1314
-glasses 473
-patches 359
-earrings 232
-monocle 178
-masks 72
