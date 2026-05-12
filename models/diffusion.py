@@ -152,15 +152,22 @@ class GaussianDiffusion(nn.Module):
         noise: Optional[torch.Tensor] = None,
         cond_emb: Optional[torch.Tensor] = None,
         cond_image: Optional[torch.Tensor] = None,
+        fg_mask: Optional[torch.Tensor] = None,
+        cond_fg_mask: Optional[torch.Tensor] = None,
+        fg_weight: float = 6.0,
+        bg_weight: float = 0.5,
+        color_weight: float = 1.0,
     ) -> torch.Tensor:
         """
-        Compute the DDPM denoising loss.
+        Compute the DDPM denoising loss with optional foreground weighting
+        and color consistency regularization.
 
-        For Task 1: x_start is (B, 6, H, W) (front+back concatenated).
-                    cond_emb optionally conditions on attribute embeddings.
-        For Task 2: x_start is (B, 3, H, W) (back image only).
-                    cond_image is (B, 3, H, W) (front image, channel-concatenated
-                    with x_t before passing to the U-Net).
+        Args:
+            fg_mask:       (B, 1, H, W) foreground mask for target, 1=foreground.
+            cond_fg_mask:  (B, 1, H, W) foreground mask for condition image.
+            fg_weight:     Foreground pixel weight multiplier.
+            bg_weight:     Background pixel weight multiplier.
+            color_weight:  Weight for front-back color consistency loss.
 
         Returns:
             Scalar loss tensor.
@@ -170,17 +177,46 @@ class GaussianDiffusion(nn.Module):
 
         x_t = self.q_sample(x_start, t, noise)
 
-        # For image-conditioned task 2, concatenate front image
         model_input = x_t
         if cond_image is not None:
             model_input = torch.cat([x_t, cond_image], dim=1)
 
         noise_pred = self.model(model_input, t, cond_emb)
 
+        # --- Per-pixel noise prediction loss ---
         if self.loss_type == "l1":
-            loss = F.l1_loss(noise_pred, noise)
+            per_pixel = (noise_pred - noise).abs()
         else:
-            loss = F.mse_loss(noise_pred, noise)
+            per_pixel = (noise_pred - noise) ** 2
+
+        # Foreground weighting
+        if fg_mask is not None:
+            fg_mask = fg_mask.to(x_start)
+            weights = bg_weight + (fg_weight - bg_weight) * fg_mask
+            loss = (per_pixel * weights).sum() / weights.sum().clamp(min=1e-6)
+        else:
+            loss = per_pixel.mean()
+
+        # --- Color consistency loss ---
+        # Estimate x0 from noise prediction to compute image-space color loss
+        if color_weight > 0.0 and cond_image is not None and fg_mask is not None:
+            acp_t = self._extract(self.alphas_cumprod, t, x_t.shape)
+            x0_pred = (x_t - (1 - acp_t).sqrt() * noise_pred) / acp_t.sqrt()
+            x0_pred = x0_pred.clamp(-1.0, 1.0)
+
+            # Per-channel foreground color mean matching
+            # front colors (from condition) vs predicted back colors
+            if cond_fg_mask is not None:
+                front_mask = cond_fg_mask.to(x_start)
+            else:
+                front_mask = fg_mask
+
+            # Compute mean color of foreground pixels per channel
+            front_colors = (cond_image * front_mask).sum(dim=(2, 3)) / front_mask.sum(dim=(2, 3)).clamp(min=1)
+            back_colors = (x0_pred * fg_mask).sum(dim=(2, 3)) / fg_mask.sum(dim=(2, 3)).clamp(min=1)
+
+            color_loss = F.mse_loss(back_colors, front_colors.detach())
+            loss = loss + color_weight * color_loss
 
         return loss
 
