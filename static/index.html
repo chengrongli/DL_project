@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pixel Sprite Generator</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">&#9876;</span>
+                <div>
+                    <h1>Pixel Sprite Generator</h1>
+                    <p class="subtitle">Diffusion-based LPC Character Synthesis</p>
+                </div>
+            </div>
+        </header>
+
+        <!-- Tab 切换 -->
+        <div class="tabs">
+            <button class="tab-btn active" data-tab="tab-flux">
+                <span class="tab-icon">&#10024;</span>
+                FLUX 角色生成
+            </button>
+            <button class="tab-btn" data-tab="tab-task2">
+                <span class="tab-icon">&#128257;</span>
+                正面 &rarr; 反面
+            </button>
+        </div>
+
+        <!-- Tab 1: FLUX 角色生成 -->
+        <div id="tab-flux" class="tab-content active">
+            <div class="card">
+                <div class="card-body">
+                    <div class="form-row">
+                        <div class="form-group" style="flex:1">
+                            <label for="char-type">角色类型</label>
+                            <select id="char-type">
+                                <option value="warrior knight in heavy armor with sword and shield">&#9876; 战士</option>
+                                <option value="mage wizard with a long blue robe and magic staff">&#9733; 法师</option>
+                                <option value="ranger archer with a bow, hood and green cloak">&#127991; 游侠</option>
+                                <option value="rogue thief in dark leather armor with daggers">&#128484; 盗贼</option>
+                                <option value="cleric healer in white robes with holy symbol">&#10013; 牧师</option>
+                                <option value="barbarian with fur armor, war paint and greataxe">&#128170; 野蛮人</option>
+                                <option value="necromancer with dark purple robes and skull staff">&#9760; 死灵法师</option>
+                                <option value="paladin in shining golden plate armor with hammer">&#127775; 圣骑士</option>
+                            </select>
+                        </div>
+                        <div class="form-group" style="flex:2">
+                            <label for="char-desc">补充描述</label>
+                            <input type="text" id="char-desc" placeholder="e.g. red hair, female, red cape, elf ears...">
+                        </div>
+                    </div>
+                    <button id="btn-flux" class="generate-btn">&#10024; 生成角色</button>
+                </div>
+            </div>
+            <div id="flux-result" class="result-area hidden">
+                <div class="sprite-pair">
+                    <div class="sprite-box">
+                        <span class="label">Front</span>
+                        <div class="sprite-frame">
+                            <img id="flux-front" class="sprite-img" alt="front">
+                        </div>
+                    </div>
+                    <div class="arrow">&#8594;</div>
+                    <div class="sprite-box">
+                        <span class="label">Back</span>
+                        <div class="sprite-frame">
+                            <img id="flux-back" class="sprite-img" alt="back">
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab 2: 正面 → 反面 -->
+        <div id="tab-task2" class="tab-content">
+            <div class="card">
+                <div class="card-body">
+                    <div class="upload-area" id="upload-area">
+                        <div class="upload-icon">&#128196;</div>
+                        <p class="upload-text">拖拽正面图到此处，或<span class="upload-link">点击选择文件</span></p>
+                        <p class="upload-hint">支持 PNG / JPG，64&times;64 像素精灵图效果最佳</p>
+                        <input type="file" id="front-upload" accept="image/*" hidden>
+                        <img id="upload-preview" class="upload-preview hidden" alt="preview">
+                    </div>
+                    <button id="btn-task2" class="generate-btn" disabled>&#128257; 生成反面</button>
+                </div>
+            </div>
+            <div id="task2-result" class="result-area hidden">
+                <div class="sprite-pair">
+                    <div class="sprite-box">
+                        <span class="label">Front (Input)</span>
+                        <div class="sprite-frame">
+                            <img id="task2-front" class="sprite-img" alt="front input">
+                        </div>
+                    </div>
+                    <div class="arrow">&#8594;</div>
+                    <div class="sprite-box">
+                        <span class="label">Back (Generated)</span>
+                        <div class="sprite-frame">
+                            <img id="task2-back" class="sprite-img" alt="back generated">
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Loading -->
+        <div id="loading" class="loading hidden">
+            <div class="spinner"></div>
+            <p>Generating sprite...</p>
+        </div>
+
+        <!-- Error -->
+        <div id="error" class="error hidden"></div>
+
+        <footer class="footer">
+            <p>Powered by Diffusion Models &amp; Flow Matching &bull; LPC Spritesheet Assets</p>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

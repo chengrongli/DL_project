@@ -4,8 +4,8 @@
 #   python train/train_task2.py --config configs/task2_config.yaml
 
 data:
-  train_dir:   "data/pairs/random_batch"  # Small sample dataset bundled with the repo
-  val_dir:     "data/pairs/random_batch"
+  train_dir:   "data/processed/task2/index_train.csv"
+  val_dir:     "data/processed/task2/index_val.csv"
   image_size:  64
   occlusion_p: 0.3     # probability of applying random occlusion augmentation
 
@@ -42,6 +42,11 @@ training:
   use_discriminator: false
   lr_disc:           1.0e-4
   lambda_adv:        0.01
+
+  # Loss weighting
+  fg_weight:     6.0    # foreground pixel weight
+  bg_weight:     0.5    # background pixel weight
+  color_weight:  1.0    # front-back color consistency weight
 
   val_every:    5
   save_every:   10
