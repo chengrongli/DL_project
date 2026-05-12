@@ -1,7 +1,7 @@
 """Flask Web UI for Pixel Sprite Generator.
 
 Mode A: FLUX text-to-sprite generation (placeholder, to be connected).
-Mode B: Front-to-back diffusion reconstruction (Task 2).
+Mode B: Front-to-back Flow Matching reconstruction (Task 2).
 """
 
 import base64
@@ -17,7 +17,7 @@ from flask import Flask, jsonify, render_template, request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from models.diffusion import GaussianDiffusion
+from models.flow_matching import FlowMatching
 from models.unet import UNet
 from utils.visualization import tensor_to_pil
 
@@ -29,7 +29,7 @@ app = Flask(__name__, static_folder="static", static_url_path="/static")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CFG_PATH = "configs/task2_config.yaml"
-CKPT_PATH = "outputs/task2/checkpoints/ckpt_epoch0199.pth"
+CKPT_PATH = "outputs/task2/checkpoints/ckpt_epoch0099.pth"
 
 with open(CFG_PATH) as f:
     CFG = yaml.safe_load(f)
@@ -50,16 +50,14 @@ _task2_unet = UNet(
     image_size=IMAGE_SIZE,
 ).to(DEVICE)
 
-_task2_diffusion = GaussianDiffusion(
+_task2_fm = FlowMatching(
     model=_task2_unet,
-    timesteps=CFG["diffusion"]["timesteps"],
-    schedule=CFG["diffusion"]["schedule"],
-    loss_type=CFG["diffusion"]["loss_type"],
+    time_scale=CFG["flow"].get("time_scale", 999.0),
 ).to(DEVICE)
 
 _ckpt = torch.load(CKPT_PATH, map_location=DEVICE)
-_task2_diffusion.load_state_dict(_ckpt["diffusion"])
-_task2_diffusion.eval()
+_task2_fm.load_state_dict(_ckpt["ema_flow_matching"])
+_task2_fm.eval()
 print(f"Task 2 model loaded on {DEVICE}")
 
 
@@ -101,7 +99,7 @@ def api_generate_flux():
 
 @app.route("/api/generate_back", methods=["POST"])
 def api_generate_back():
-    """Mode B: Upload front image, generate back via Task 2 diffusion."""
+    """Mode B: Upload front image, generate back via Task 2 Flow Matching."""
     if "image" not in request.files:
         return jsonify({"error": "No image uploaded"}), 400
 
@@ -116,11 +114,9 @@ def api_generate_back():
     front_t = front_t.unsqueeze(0).to(DEVICE)
 
     with torch.no_grad():
-        back_t = _task2_diffusion.ddim_sample(
-            shape=(1, 3, IMAGE_SIZE, IMAGE_SIZE),
-            device=DEVICE,
-            ddim_steps=50,
-            eta=0.0,
+        back_t = _task2_fm.sample(
+            sample_shape=(1, 3, IMAGE_SIZE, IMAGE_SIZE),
+            steps=CFG["flow"].get("sample_steps", 50),
             cond_image=front_t,
         )
 

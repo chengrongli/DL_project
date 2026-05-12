@@ -1,19 +1,19 @@
 """
-Task 2 Inference – Front-to-back reconstruction.
+Task 2 Inference – Front-to-back reconstruction (Flow Matching).
 
 Usage:
-    python inference/reconstruct.py \\
-        --config  configs/task2_config.yaml \\
-        --ckpt    outputs/task2/checkpoints/ckpt_epoch0099.pth \\
-        --input   path/to/front.png \\
-        --steps   50 \\
+    python inference/reconstruct.py \
+        --config  configs/task2_config.yaml \
+        --ckpt    outputs/task2/checkpoints/ckpt_epoch0099.pth \
+        --input   path/to/front.png \
+        --steps   50 \
         --out     outputs/task2/reconstructed/
 
     # Batch mode: reconstruct all PNGs in a directory
-    python inference/reconstruct.py \\
-        --config  configs/task2_config.yaml \\
-        --ckpt    outputs/task2/checkpoints/ckpt_epoch0099.pth \\
-        --input   path/to/front_images/ \\
+    python inference/reconstruct.py \
+        --config  configs/task2_config.yaml \
+        --ckpt    outputs/task2/checkpoints/ckpt_epoch0099.pth \
+        --input   path/to/front_images/ \
         --out     outputs/task2/reconstructed/
 
 Outputs:
@@ -36,7 +36,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from models.diffusion import GaussianDiffusion
+from models.flow_matching import FlowMatching
 from models.unet import UNet
 from utils.visualization import tensor_to_pil, side_by_side
 
@@ -46,7 +46,7 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def build_model(cfg: dict, device: torch.device, ckpt_path: str) -> GaussianDiffusion:
+def build_model(cfg: dict, device: torch.device, ckpt_path: str) -> FlowMatching:
     unet = UNet(
         in_channels=cfg["model"]["in_channels"],
         out_channels=cfg["model"]["out_channels"],
@@ -60,17 +60,15 @@ def build_model(cfg: dict, device: torch.device, ckpt_path: str) -> GaussianDiff
         image_size=cfg["data"]["image_size"],
     ).to(device)
 
-    diffusion = GaussianDiffusion(
+    fm = FlowMatching(
         model=unet,
-        timesteps=cfg["diffusion"]["timesteps"],
-        schedule=cfg["diffusion"]["schedule"],
-        loss_type=cfg["diffusion"]["loss_type"],
+        time_scale=cfg["flow"].get("time_scale", 999.0),
     ).to(device)
 
     ckpt = torch.load(ckpt_path, map_location=device)
-    diffusion.load_state_dict(ckpt["diffusion"])
-    diffusion.eval()
-    return diffusion
+    fm.load_state_dict(ckpt["ema_flow_matching"])
+    fm.eval()
+    return fm
 
 
 def preprocess(image_path: str, image_size: int) -> torch.Tensor:
@@ -124,31 +122,20 @@ def preprocess(image_path: str, image_size: int) -> torch.Tensor:
 
 
 def reconstruct(
-    diffusion: GaussianDiffusion,
+    fm: FlowMatching,
     front_tensor: torch.Tensor,
     device: torch.device,
-    ddim_steps: int = 50,
-    eta: float = 0.0,
+    steps: int = 50,
     image_size: int = 64,
 ) -> torch.Tensor:
-    """
-    Generate back view conditioned on front_tensor.
-
-    Args:
-        front_tensor: (B, 3, H, W) front image tensor in [−1, 1].
-
-    Returns:
-        (B, 3, H, W) predicted back image in [−1, 1].
-    """
+    """Generate back view conditioned on front_tensor via Flow Matching ODE."""
     front_tensor = front_tensor.to(device)
     B = front_tensor.shape[0]
 
     with torch.no_grad():
-        back_pred = diffusion.ddim_sample(
-            shape=(B, 3, image_size, image_size),
-            device=device,
-            ddim_steps=ddim_steps,
-            eta=eta,
+        back_pred = fm.sample(
+            sample_shape=(B, 3, image_size, image_size),
+            steps=steps,
             cond_image=front_tensor,
         )
     return back_pred
@@ -170,8 +157,7 @@ def main() -> None:
     parser.add_argument("--config", default="configs/task2_config.yaml")
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--input", required=True, help="Front image or directory of images")
-    parser.add_argument("--steps", type=int, default=50, help="DDIM steps")
-    parser.add_argument("--eta", type=float, default=0.0)
+    parser.add_argument("--steps", type=int, default=50, help="Flow Matching ODE steps")
     parser.add_argument("--out", default="outputs/task2/reconstructed/")
     args = parser.parse_args()
 
@@ -179,18 +165,18 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     image_size = cfg["data"]["image_size"]
 
-    diffusion = build_model(cfg, device, args.ckpt)
+    fm = build_model(cfg, device, args.ckpt)
     os.makedirs(args.out, exist_ok=True)
 
     image_paths = collect_inputs(args.input)
-    print(f"Processing {len(image_paths)} image(s)…")
+    print(f"Processing {len(image_paths)} image(s)}…")
 
     for img_path in image_paths:
         stem = Path(img_path).stem
         front_t = preprocess(img_path, image_size)
-        back_t = reconstruct(diffusion, front_t, device,
-                              ddim_steps=args.steps, eta=args.eta,
-                              image_size=image_size)
+        back_t = reconstruct(fm, front_t, device,
+                             steps=args.steps,
+                             image_size=image_size)
 
         front_pil = tensor_to_pil(front_t[0])
         back_pil = tensor_to_pil(back_t[0])

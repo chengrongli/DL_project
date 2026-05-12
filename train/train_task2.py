@@ -1,33 +1,29 @@
 """
-Task 2 Training Script – Front-to-back reconstruction.
+Task 2 Training Script – Front-to-back reconstruction (Flow Matching).
 
 Usage:
     python train/train_task2.py --config configs/task2_config.yaml
 
-The model is an image-to-image conditional diffusion U-Net that takes a
-front-view sprite (3-channel) as conditioning and generates the corresponding
-back-view sprite (3-channel).
-
+Uses Flow Matching (linear interpolation path) with a conditional U-Net.
 The front image is channel-concatenated with the noisy back image before
 entering the U-Net (so U-Net in_channels=6, out_channels=3).
 
-Optional losses:
-  - Primary: L2 noise prediction loss.
-  - Perceptual / palette-consistency: added via an optional LPIPS penalty.
-  - Adversarial fine-tuning: a small PatchGAN discriminator can be enabled
-    via cfg["training"]["use_discriminator"] = true.
+Losses:
+  - Primary: MSE on predicted velocity vs target velocity (z - x0).
+  - Foreground weighting: fg pixels weighted more heavily.
+  - Color consistency: front vs back foreground channel mean matching.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import sys
 from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F_nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -38,57 +34,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import yaml
 
 from data_code.dataset import FrontToBackDataset
-from models.diffusion import GaussianDiffusion
+from models.flow_matching import FlowMatching
 from models.unet import UNet
 from utils.visualization import save_sample_grid
-
-
-# ---------------------------------------------------------------------------
-# Optional: tiny PatchGAN discriminator
-# ---------------------------------------------------------------------------
-
-class PatchDiscriminator(nn.Module):
-    """
-    Simple 3-level PatchGAN discriminator.
-    Input: (B, 3+3, H, W) – predicted back concatenated with front condition.
-    """
-
-    def __init__(self, in_channels: int = 6, ndf: int = 32) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            # C1
-            nn.Conv2d(in_channels, ndf, 4, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            # C2
-            nn.Conv2d(ndf, ndf * 2, 4, stride=2, padding=1),
-            nn.InstanceNorm2d(ndf * 2),
-            nn.LeakyReLU(0.2, inplace=True),
-            # C3
-            nn.Conv2d(ndf * 2, ndf * 4, 4, stride=2, padding=1),
-            nn.InstanceNorm2d(ndf * 4),
-            nn.LeakyReLU(0.2, inplace=True),
-            # C4 – output patch map
-            nn.Conv2d(ndf * 4, 1, 4, stride=1, padding=1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-def disc_loss(real_pred: torch.Tensor, fake_pred: torch.Tensor) -> torch.Tensor:
-    real_loss = F_nn.binary_cross_entropy_with_logits(
-        real_pred, torch.ones_like(real_pred)
-    )
-    fake_loss = F_nn.binary_cross_entropy_with_logits(
-        fake_pred, torch.zeros_like(fake_pred)
-    )
-    return (real_loss + fake_loss) * 0.5
-
-
-def gen_adv_loss(fake_pred: torch.Tensor) -> torch.Tensor:
-    return F_nn.binary_cross_entropy_with_logits(
-        fake_pred, torch.ones_like(fake_pred)
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -125,10 +73,10 @@ def _resolve_device(device_str: str | None) -> torch.device:
     return device
 
 
-def build_model(cfg: dict, device: torch.device):
+def build_model(cfg: dict, device: torch.device) -> FlowMatching:
     unet = UNet(
         in_channels=cfg["model"]["in_channels"],    # 6 = noisy_back(3) + front_cond(3)
-        out_channels=cfg["model"]["out_channels"],  # 3 = back noise
+        out_channels=cfg["model"]["out_channels"],  # 3 = back channels
         model_channels=cfg["model"]["model_channels"],
         channel_mults=tuple(cfg["model"]["channel_mults"]),
         n_res_blocks=cfg["model"]["n_res_blocks"],
@@ -139,14 +87,12 @@ def build_model(cfg: dict, device: torch.device):
         image_size=cfg["data"]["image_size"],
     ).to(device)
 
-    diffusion = GaussianDiffusion(
+    fm = FlowMatching(
         model=unet,
-        timesteps=cfg["diffusion"]["timesteps"],
-        schedule=cfg["diffusion"]["schedule"],
-        loss_type=cfg["diffusion"]["loss_type"],
+        time_scale=cfg["flow"].get("time_scale", 999.0),
     ).to(device)
 
-    return diffusion
+    return fm
 
 
 # ---------------------------------------------------------------------------
@@ -154,23 +100,20 @@ def build_model(cfg: dict, device: torch.device):
 # ---------------------------------------------------------------------------
 
 def train_epoch(
-    diffusion: GaussianDiffusion,
+    fm: FlowMatching,
     loader: DataLoader,
-    optimizer_g: optim.Optimizer,
+    optimizer: optim.Optimizer,
     device: torch.device,
-    disc: nn.Module = None,
-    optimizer_d: optim.Optimizer = None,
-    lambda_adv: float = 0.01,
+    ema_fm: FlowMatching | None = None,
+    ema_decay: float = 0.999,
     scaler=None,
     fg_weight: float = 6.0,
     bg_weight: float = 0.5,
     color_weight: float = 1.0,
 ) -> dict:
-    diffusion.train()
-    if disc is not None:
-        disc.train()
+    fm.train()
 
-    metrics = {"loss_diff": 0.0, "loss_disc": 0.0, "loss_gen_adv": 0.0}
+    metrics = {"loss_total": 0.0, "loss_mse_raw": 0.0, "loss_fg_rgb": 0.0, "loss_bg_rgb": 0.0}
     n = 0
 
     for batch in tqdm(loader, leave=False, desc="  train"):
@@ -180,72 +123,55 @@ def train_epoch(
         B = target.shape[0]
         n += 1
 
-        t = torch.randint(0, diffusion.timesteps, (B,), device=device)
-
         # Build front foreground mask from condition (non-black = foreground)
         cond_fg = (cond.abs().sum(dim=1, keepdim=True) > 0.1).float()
 
-        # --- Generator / diffusion step ---
-        optimizer_g.zero_grad()
+        optimizer.zero_grad()
 
         if scaler is not None:
             with torch.cuda.amp.autocast():
-                loss_diff = diffusion.p_losses(
-                    target, t, cond_image=cond,
-                    fg_mask=target_alpha, cond_fg_mask=cond_fg,
-                    fg_weight=fg_weight, bg_weight=bg_weight,
+                loss, components = fm.compute_loss(
+                    target,
+                    fg_mask=target_alpha,
+                    cond_image=cond,
+                    cond_fg_mask=cond_fg,
+                    background_weight=bg_weight,
+                    foreground_weight=fg_weight,
                     color_weight=color_weight,
+                    return_components=True,
                 )
         else:
-            loss_diff = diffusion.p_losses(
-                target, t, cond_image=cond,
-                fg_mask=target_alpha, cond_fg_mask=cond_fg,
-                fg_weight=fg_weight, bg_weight=bg_weight,
+            loss, components = fm.compute_loss(
+                target,
+                fg_mask=target_alpha,
+                cond_image=cond,
+                cond_fg_mask=cond_fg,
+                background_weight=bg_weight,
+                foreground_weight=fg_weight,
                 color_weight=color_weight,
+                return_components=True,
             )
 
-        loss_g = loss_diff
-
-        # Adversarial loss (optional, only during fine-tuning)
-        if disc is not None:
-            # Generate a denoised sample (expensive, use only a subset)
-            with torch.no_grad():
-                fake_back = diffusion.ddim_sample(
-                    shape=(B, 3, target.shape[2], target.shape[3]),
-                    device=device,
-                    ddim_steps=10,
-                    cond_image=cond,
-                )
-            fake_input = torch.cat([fake_back, cond], dim=1)
-            fake_pred = disc(fake_input)
-            loss_gen_adv = gen_adv_loss(fake_pred)
-            loss_g = loss_g + lambda_adv * loss_gen_adv
-            metrics["loss_gen_adv"] += loss_gen_adv.item()
-
         if scaler is not None:
-            scaler.scale(loss_g).backward()
-            scaler.unscale_(optimizer_g)
-            torch.nn.utils.clip_grad_norm_(diffusion.parameters(), 1.0)
-            scaler.step(optimizer_g)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(fm.parameters(), 1.0)
+            scaler.step(optimizer)
             scaler.update()
         else:
-            loss_g.backward()
-            torch.nn.utils.clip_grad_norm_(diffusion.parameters(), 1.0)
-            optimizer_g.step()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(fm.parameters(), 1.0)
+            optimizer.step()
 
-        metrics["loss_diff"] += loss_diff.item()
+        # EMA update
+        if ema_fm is not None:
+            with torch.no_grad():
+                for ep, p in zip(ema_fm.parameters(), fm.parameters()):
+                    ep.data.mul_(ema_decay).add_(p.data, alpha=1.0 - ema_decay)
 
-        # --- Discriminator step ---
-        if disc is not None and optimizer_d is not None:
-            optimizer_d.zero_grad()
-            real_input = torch.cat([target, cond], dim=1)
-            real_pred = disc(real_input)
-            fake_input_d = torch.cat([fake_back.detach(), cond], dim=1)
-            fake_pred_d = disc(fake_input_d)
-            loss_d = disc_loss(real_pred, fake_pred_d)
-            loss_d.backward()
-            optimizer_d.step()
-            metrics["loss_disc"] += loss_d.item()
+        for k in metrics:
+            if k in components:
+                metrics[k] += components[k].item()
 
     for k in metrics:
         metrics[k] /= max(n, 1)
@@ -257,7 +183,7 @@ def train_epoch(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train Task 2 – front-to-back reconstruction")
+    parser = argparse.ArgumentParser(description="Train Task 2 – front-to-back reconstruction (Flow Matching)")
     parser.add_argument("--config", default="configs/task2_config.yaml")
     parser.add_argument("--resume", default=None)
     args = parser.parse_args()
@@ -294,10 +220,10 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
-    # Models
-    diffusion = build_model(cfg, device)
+    # Model
+    fm = build_model(cfg, device)
 
-    # 快速一致性检查：避免“数据是 RGBA(4ch) 但模型按 RGB(3ch) 配置”这类直接崩溃。
+    # Channel consistency check
     sample = train_ds[0]
     cond_ch = int(sample["condition"].shape[0])
     target_ch = int(sample["target"].shape[0])
@@ -310,31 +236,41 @@ def main() -> None:
             f"but dataset implies ({expected_in}, {expected_out}). "
             "Please update config or dataset channel settings."
         )
-    optimizer_g = optim.AdamW(
-        diffusion.parameters(),
+
+    optimizer = optim.AdamW(
+        fm.parameters(),
         lr=cfg["training"]["lr"],
         weight_decay=cfg["training"].get("weight_decay", 1e-4),
     )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer_g,
+        optimizer,
         T_max=cfg["training"]["epochs"],
         eta_min=cfg["training"].get("lr_min", 1e-6),
     )
 
-    disc = None
-    optimizer_d = None
-    if cfg["training"].get("use_discriminator", False):
-        disc = PatchDiscriminator().to(device)
-        optimizer_d = optim.AdamW(disc.parameters(), lr=cfg["training"]["lr_disc"])
+    # EMA model
+    ema_decay = cfg["training"].get("ema_decay", 0.999)
+    ema_fm = copy.deepcopy(fm)
+    ema_fm.load_state_dict(fm.state_dict())
+    for p in ema_fm.parameters():
+        p.requires_grad_(False)
 
     use_amp = cfg["training"].get("mixed_precision", False) and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
 
+    fg_weight = cfg["training"].get("fg_weight", 6.0)
+    bg_weight = cfg["training"].get("bg_weight", 0.5)
+    color_weight = cfg["training"].get("color_weight", 1.0)
+
     start_epoch = 0
     if args.resume and os.path.isfile(args.resume):
         ckpt = torch.load(args.resume, map_location=device)
-        diffusion.load_state_dict(ckpt["diffusion"])
-        optimizer_g.load_state_dict(ckpt["optimizer_g"])
+        fm.load_state_dict(ckpt["flow_matching"])
+        if "ema_flow_matching" in ckpt:
+            ema_fm.load_state_dict(ckpt["ema_flow_matching"])
+        else:
+            ema_fm.load_state_dict(fm.state_dict())
+        optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt.get("epoch", 0) + 1
         print(f"Resumed from epoch {start_epoch}")
 
@@ -346,19 +282,17 @@ def main() -> None:
 
     writer = SummaryWriter(log_dir=os.path.join(out_dir, "logs"))
 
-    fg_weight = cfg["training"].get("fg_weight", 6.0)
-    bg_weight = cfg["training"].get("bg_weight", 0.5)
-    color_weight = cfg["training"].get("color_weight", 1.0)
+    sample_steps = cfg["flow"].get("sample_steps", 50)
+    img_size = cfg["data"]["image_size"]
 
     for epoch in range(start_epoch, cfg["training"]["epochs"]):
         metrics = train_epoch(
-            diffusion, train_loader, optimizer_g, device,
-            disc=disc, optimizer_d=optimizer_d,
-            lambda_adv=cfg["training"].get("lambda_adv", 0.01),
+            fm, train_loader, optimizer, device,
+            ema_fm=ema_fm, ema_decay=ema_decay,
             scaler=scaler,
-            fg_weight=cfg["training"].get("fg_weight", 6.0),
-            bg_weight=cfg["training"].get("bg_weight", 0.5),
-            color_weight=cfg["training"].get("color_weight", 1.0),
+            fg_weight=fg_weight,
+            bg_weight=bg_weight,
+            color_weight=color_weight,
         )
         scheduler.step()
 
@@ -366,62 +300,61 @@ def main() -> None:
             if v > 0:
                 writer.add_scalar(f"train/{k}", v, epoch)
         print(
-            f"Epoch {epoch:04d}  diff={metrics['loss_diff']:.5f}"
-            f"  disc={metrics['loss_disc']:.5f}"
+            f"Epoch {epoch:04d}  loss={metrics['loss_total']:.5f}"
+            f"  fg_rgb={metrics['loss_fg_rgb']:.5f}"
+            f"  bg_rgb={metrics['loss_bg_rgb']:.5f}"
             f"  lr={scheduler.get_last_lr()[0]:.2e}"
         )
 
         # Validation
         if (epoch + 1) % cfg["training"].get("val_every", 5) == 0:
-            diffusion.eval()
+            fm.eval()
             val_loss = 0.0
+            n_val = 0
             with torch.no_grad():
                 for batch in val_loader:
                     cond = batch["condition"].to(device)
                     target = batch["target"].to(device)
                     target_alpha = batch["target_alpha"].to(device)
                     cond_fg = (cond.abs().sum(dim=1, keepdim=True) > 0.1).float()
-                    B = target.shape[0]
-                    t = torch.randint(0, diffusion.timesteps, (B,), device=device)
-                    val_loss += diffusion.p_losses(
-                        target, t, cond_image=cond,
-                        fg_mask=target_alpha, cond_fg_mask=cond_fg,
-                        fg_weight=fg_weight, bg_weight=bg_weight,
+                    loss = fm.compute_loss(
+                        target,
+                        fg_mask=target_alpha,
+                        cond_image=cond,
+                        cond_fg_mask=cond_fg,
+                        background_weight=bg_weight,
+                        foreground_weight=fg_weight,
                         color_weight=color_weight,
-                    ).item()
-            val_loss /= len(val_loader)
-            writer.add_scalar("val/loss_diff", val_loss, epoch)
+                    )
+                    val_loss += loss.item()
+                    n_val += 1
+            val_loss /= max(n_val, 1)
+            writer.add_scalar("val/loss_total", val_loss, epoch)
             print(f"  val_loss={val_loss:.5f}")
 
         # Save checkpoint
         if (epoch + 1) % cfg["training"].get("save_every", 10) == 0:
             ckpt_path = os.path.join(ckpt_dir, f"ckpt_epoch{epoch:04d}.pth")
-            save_dict = {
+            torch.save({
                 "epoch": epoch,
-                "diffusion": diffusion.state_dict(),
-                "optimizer_g": optimizer_g.state_dict(),
-            }
-            if disc is not None:
-                save_dict["disc"] = disc.state_dict()
-                save_dict["optimizer_d"] = optimizer_d.state_dict()
-            torch.save(save_dict, ckpt_path)
+                "flow_matching": fm.state_dict(),
+                "ema_flow_matching": ema_fm.state_dict(),
+                "optimizer": optimizer.state_dict(),
+            }, ckpt_path)
             print(f"  Saved checkpoint: {ckpt_path}")
 
         # Visual samples
         if (epoch + 1) % cfg["training"].get("sample_every", 10) == 0:
-            diffusion.eval()
+            ema_fm.eval()
             try:
                 sample_batch = next(iter(val_loader))
                 cond_vis = sample_batch["condition"][:4].to(device)
                 with torch.no_grad():
-                    gen_back = diffusion.ddim_sample(
-                        shape=(min(4, cond_vis.shape[0]), 3,
-                               cfg["data"]["image_size"], cfg["data"]["image_size"]),
-                        device=device,
-                        ddim_steps=cfg["diffusion"].get("ddim_steps", 50),
+                    gen_back = ema_fm.sample(
+                        sample_shape=(min(4, cond_vis.shape[0]), 3, img_size, img_size),
+                        steps=sample_steps,
                         cond_image=cond_vis,
                     )
-                # Save condition and generated side-by-side
                 vis = torch.cat([cond_vis, gen_back], dim=0)
                 grid_path = os.path.join(sample_dir, f"sample_epoch{epoch:04d}.png")
                 save_sample_grid(vis, grid_path, nrow=4)

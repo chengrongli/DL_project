@@ -21,11 +21,9 @@ model:
   time_emb_dim:     256
   dropout:          0.1
 
-diffusion:
-  timesteps:  1000
-  schedule:   "cosine"
-  loss_type:  "l2"
-  ddim_steps: 50
+flow:
+  time_scale:    999.0
+  sample_steps:  50
 
 training:
   device:           "cuda"
@@ -47,6 +45,9 @@ training:
   fg_weight:     6.0    # foreground pixel weight
   bg_weight:     0.5    # background pixel weight
   color_weight:  1.0    # front-back color consistency weight
+
+  # EMA
+  ema_decay:     0.999
 
   val_every:    5
   save_every:   10
