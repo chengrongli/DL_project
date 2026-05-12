@@ -157,6 +157,7 @@ class GaussianDiffusion(nn.Module):
         fg_weight: float = 6.0,
         bg_weight: float = 0.5,
         color_weight: float = 1.0,
+        cond_drop_prob: float = 0.0,
     ) -> torch.Tensor:
         """
         Compute the DDPM denoising loss with optional foreground weighting
@@ -177,9 +178,20 @@ class GaussianDiffusion(nn.Module):
 
         x_t = self.q_sample(x_start, t, noise)
 
+        # Classifier-free guidance: with prob `cond_drop_prob` per-sample,
+        # replace the conditioning image with zeros. This teaches the network
+        # an unconditional branch so CFG can pull it back toward the prior
+        # when the front condition is OOD.
+        cond_image_in = cond_image
+        if cond_image is not None and cond_drop_prob > 0.0:
+            B = x_start.shape[0]
+            keep = (torch.rand(B, device=x_start.device) >= cond_drop_prob).float()
+            keep = keep.reshape(B, *([1] * (cond_image.ndim - 1)))
+            cond_image_in = cond_image * keep
+
         model_input = x_t
-        if cond_image is not None:
-            model_input = torch.cat([x_t, cond_image], dim=1)
+        if cond_image_in is not None:
+            model_input = torch.cat([x_t, cond_image_in], dim=1)
 
         noise_pred = self.model(model_input, t, cond_emb)
 
@@ -244,11 +256,12 @@ class GaussianDiffusion(nn.Module):
 
         noise_pred = self.model(model_input, t, cond_emb)
 
-        # Classifier-free guidance
-        if cfg_scale != 1.0 and uncond_emb is not None:
+        # Classifier-free guidance: build the unconditional branch by zeroing
+        # the conditioning image (and/or the conditioning embedding).
+        if cfg_scale != 1.0:
             model_input_unc = x_t
             if cond_image is not None:
-                model_input_unc = torch.cat([x_t, cond_image], dim=1)
+                model_input_unc = torch.cat([x_t, torch.zeros_like(cond_image)], dim=1)
             noise_pred_unc = self.model(model_input_unc, t, uncond_emb)
             noise_pred = noise_pred_unc + cfg_scale * (noise_pred - noise_pred_unc)
 
@@ -364,10 +377,10 @@ class GaussianDiffusion(nn.Module):
 
             noise_pred = self.model(model_input, t, cond_emb)
 
-            if cfg_scale != 1.0 and uncond_emb is not None:
+            if cfg_scale != 1.0:
                 model_input_unc = x
                 if cond_image is not None:
-                    model_input_unc = torch.cat([x, cond_image], dim=1)
+                    model_input_unc = torch.cat([x, torch.zeros_like(cond_image)], dim=1)
                 noise_pred_unc = self.model(model_input_unc, t, uncond_emb)
                 noise_pred = noise_pred_unc + cfg_scale * (noise_pred - noise_pred_unc)
 

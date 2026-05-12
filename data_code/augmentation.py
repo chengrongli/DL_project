@@ -41,20 +41,28 @@ def random_horizontal_flip(
 def random_color_jitter(
     front: Image.Image,
     back: Image.Image,
-    brightness: float = 0.1,
-    contrast: float = 0.1,
-    saturation: float = 0.1,
-    hue: float = 0.05,
+    brightness: float = 0.25,
+    contrast: float = 0.25,
+    saturation: float = 0.3,
+    hue: float = 0.12,
+    strength: float = 1.0,
 ) -> Tuple[Image.Image, Image.Image]:
     """对 front/back 同时施加相同的随机色调扰动。
 
     保留 alpha 通道：调色只作用在 RGB 上，免得 TF 函数对 RGBA 的不定行为
     或 alpha 被调成非二值。
     """
-    brightness_factor = random.uniform(max(0, 1 - brightness), 1 + brightness)
-    contrast_factor = random.uniform(max(0, 1 - contrast), 1 + contrast)
-    saturation_factor = random.uniform(max(0, 1 - saturation), 1 + saturation)
-    hue_factor = random.uniform(-hue, hue)
+    # Allow scaling the jitter strength (useful to switch between mild/strong)
+    brightness_factor = random.uniform(
+        max(0, 1 - brightness * strength), 1 + brightness * strength
+    )
+    contrast_factor = random.uniform(
+        max(0, 1 - contrast * strength), 1 + contrast * strength
+    )
+    saturation_factor = random.uniform(
+        max(0, 1 - saturation * strength), 1 + saturation * strength
+    )
+    hue_factor = random.uniform(-hue * strength, hue * strength)
 
     def _jitter(img: Image.Image) -> Image.Image:
         has_alpha = (img.mode == "RGBA")
@@ -121,13 +129,17 @@ def random_palette_shift(
 
 def random_occlusion(
     image: Image.Image,
-    max_fraction: float = 0.2,
-    p: float = 0.3,
+    max_fraction: float = 0.35,
+    p: float = 0.5,
+    n_patches_max: int = 3,
+    intensity: float = 0.5,
+    fill: str = "zero",
 ) -> Image.Image:
     """
-    Randomly occlude a rectangular patch of an image with zeros.
+    Randomly occlude one or more rectangular patches of an image with zeros.
 
-    Used to make front-to-back reconstruction robust to missing regions.
+    Used to make front-to-back reconstruction robust to missing regions and
+    to break the "copy-front-shape" shortcut that hurts OOD generalization.
     Applied only to the front image (Task 2 robustness augmentation).
     """
     if random.random() >= p:
@@ -135,12 +147,169 @@ def random_occlusion(
 
     arr = np.array(image).copy()
     h, w = arr.shape[:2]
-    ph = random.randint(1, max(1, int(h * max_fraction)))
-    pw = random.randint(1, max(1, int(w * max_fraction)))
-    y0 = random.randint(0, h - ph)
-    x0 = random.randint(0, w - pw)
-    arr[y0 : y0 + ph, x0 : x0 + pw] = 0
+    # intensity controls size and fill type: higher intensity -> larger patches
+    scale = 0.5 + float(np.clip(intensity, 0.0, 1.0)) * 1.5
+    n_patches = random.randint(1, max(1, int(n_patches_max * scale)))
+    for _ in range(n_patches):
+        ph = random.randint(1, max(1, int(h * max_fraction * scale)))
+        pw = random.randint(1, max(1, int(w * max_fraction * scale)))
+        y0 = random.randint(0, max(0, h - ph))
+        x0 = random.randint(0, max(0, w - pw))
+
+        if fill == "zero":
+            arr[y0 : y0 + ph, x0 : x0 + pw] = 0
+        elif fill == "noise":
+            noise = (np.random.randn(ph, pw, arr.shape[2]) * 255.0 * intensity).astype(
+                np.int32
+            )
+            patch = arr[y0 : y0 + ph, x0 : x0 + pw].astype(np.int32) + noise
+            arr[y0 : y0 + ph, x0 : x0 + pw] = np.clip(patch, 0, 255).astype(np.uint8)
+        elif fill == "color":
+            color = np.array(
+                [
+                    random.randint(0, 255),
+                    random.randint(0, 255),
+                    random.randint(0, 255),
+                ],
+                dtype=np.uint8,
+            )
+            if arr.shape[2] == 4:
+                alpha_val = int(255 * (1.0 - intensity))
+                color = np.concatenate([color, np.array([alpha_val], dtype=np.uint8)])
+            arr[y0 : y0 + ph, x0 : x0 + pw] = color
+        else:
+            # unknown fill mode -> fall back to zero
+            arr[y0 : y0 + ph, x0 : x0 + pw] = 0
+
     return Image.fromarray(arr)
+
+
+# ---------------------------------------------------------------------------
+# Front-only augmentations (used to break the copy-shortcut in Task 2)
+# ---------------------------------------------------------------------------
+
+def front_only_geometric_jitter(
+    image: Image.Image,
+    p: float = 0.7,
+    max_translate: int = 2,
+    max_rotate_deg: float = 6.0,
+    max_scale: float = 0.06,
+) -> Image.Image:
+    """Apply a small geometric perturbation **only** to the front image.
+
+    Goal: prevent the model from learning a per-pixel "copy front, paint back"
+    shortcut. The back stays untouched, so the model has to align via
+    semantics rather than pixel coordinates.
+
+    Magnitudes are intentionally small (~2 px / ~6°) so the front still
+    semantically matches the back; we are jittering, not breaking, alignment.
+    """
+    if random.random() >= p:
+        return image
+
+    angle = random.uniform(-max_rotate_deg, max_rotate_deg)
+    tx = random.randint(-max_translate, max_translate)
+    ty = random.randint(-max_translate, max_translate)
+    scale = 1.0 + random.uniform(-max_scale, max_scale)
+
+    return TF.affine(
+        image,
+        angle=angle,
+        translate=(tx, ty),
+        scale=scale,
+        shear=(0.0, 0.0),
+        interpolation=TF.InterpolationMode.NEAREST,
+        fill=0,
+    )
+
+
+def front_only_palette_perturb(
+    image: Image.Image,
+    p: float = 0.5,
+    grayscale_p: float = 0.15,
+    posterize_p: float = 0.2,
+    posterize_bits: int = 4,
+    hue_shift: float = 0.2,
+) -> Image.Image:
+    """Aggressively perturb the front's palette while keeping alpha intact.
+
+    Forces the model to treat the front condition as a *shape/identity cue*
+    rather than a literal color source. Without this, the network learns to
+    just copy the LPC palette and breaks on any OOD recoloring (real photos,
+    other pixel-art styles, etc.).
+    """
+    if random.random() >= p:
+        return image
+
+    has_alpha = (image.mode == "RGBA")
+    if has_alpha:
+        alpha = image.getchannel("A")
+        rgb = image.convert("RGB")
+    else:
+        rgb = image
+
+    # Strong hue shift
+    if hue_shift > 0:
+        rgb = TF.adjust_hue(rgb, random.uniform(-hue_shift, hue_shift))
+
+    # Occasionally collapse to grayscale
+    if random.random() < grayscale_p:
+        rgb = TF.rgb_to_grayscale(rgb, num_output_channels=3)
+
+    # Occasionally posterize (cartoonify the palette further)
+    if random.random() < posterize_p:
+        rgb = TF.posterize(rgb, bits=max(1, posterize_bits))
+
+    if has_alpha:
+        return Image.merge("RGBA", (*rgb.split(), alpha))
+    return rgb
+
+
+def front_only_background_noise_tensor(
+    cond_rgb: torch.Tensor,
+    cond_alpha: torch.Tensor,
+    p: float = 0.4,
+    noise_strength: float = 0.6,
+) -> torch.Tensor:
+    """Replace the transparent background of the front with random color/noise.
+
+    Operates **at the tensor stage** (RGB in [-1, 1], alpha in [0, 1]) so that
+    it survives the alpha-premultiply step inside ``_rgba_to_rgba_tensor``.
+
+    The model must not assume "background = black/transparent" — that's a cue
+    that disappears on OOD inputs (e.g. photos with cluttered backgrounds).
+    Only the alpha=0 region is overwritten; the foreground sprite is preserved.
+
+    Args:
+        cond_rgb:   (3, H, W) front RGB in [-1, 1] (already premultiplied).
+        cond_alpha: (1, H, W) binary front alpha mask in [0, 1].
+
+    Returns:
+        (3, H, W) tensor in [-1, 1] with the background region replaced.
+    """
+    if random.random() >= p:
+        return cond_rgb
+
+    _, h, w = cond_rgb.shape
+    bg_type = random.choice(["solid", "noise", "gradient"])
+
+    if bg_type == "solid":
+        color = torch.empty(3).uniform_(-1.0, 1.0)
+        bg = color.view(3, 1, 1).expand(3, h, w).clone()
+    elif bg_type == "noise":
+        bg = torch.empty(3, h, w).uniform_(-1.0, 1.0)
+        base = torch.empty(3).uniform_(-1.0, 1.0).view(3, 1, 1)
+        bg = bg * noise_strength + base * (1.0 - noise_strength)
+    else:  # gradient
+        c0 = torch.empty(3).uniform_(-1.0, 1.0).view(3, 1, 1)
+        c1 = torch.empty(3).uniform_(-1.0, 1.0).view(3, 1, 1)
+        ramp = torch.linspace(0.0, 1.0, w).view(1, 1, w)
+        bg = c0 * (1.0 - ramp) + c1 * ramp
+        bg = bg.expand(3, h, w).clone()
+
+    fg_mask = cond_alpha  # (1, H, W) in [0, 1]
+    composed = cond_rgb * fg_mask + bg * (1.0 - fg_mask)
+    return composed.clamp(-1.0, 1.0)
 
 
 def _rgba_to_rgba_tensor(img: Image.Image, size: int) -> torch.Tensor:

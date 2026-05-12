@@ -38,4 +38,4 @@ training:
   sample_every: 50
   sample_count: 16
 
-  out_dir: "outputs/task1_flow"
+  out_dir: "outputs/task1"

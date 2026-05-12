@@ -19,16 +19,20 @@ import csv
 import os
 import random
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
 from data_code.augmentation import (
+    front_only_background_noise_tensor,
+    front_only_geometric_jitter,
+    front_only_palette_perturb,
     random_color_jitter,
     random_horizontal_flip,
     random_occlusion,
+    random_palette_shift,
     to_tensor_pair,
 )
 
@@ -95,35 +99,64 @@ def _write_index(pairs: List[Tuple[str, str]], out_path: str) -> None:
 # Base dataset
 # ---------------------------------------------------------------------------
 
+def _resolve_one_source(data_source: str) -> List[Tuple[str, str]]:
+    if os.path.isfile(data_source):
+        return _load_index(data_source)
+    if os.path.isdir(data_source):
+        return _scan_directory(data_source)
+    raise FileNotFoundError(
+        f"data_source must be an existing file or directory: {data_source}"
+    )
+
+
 class _BaseSpriteDataset(Dataset):
     """
-    Base dataset that loads front/back image pairs from an index or directory.
+    Base dataset that loads front/back image pairs from one or more sources.
+
+    ``data_source`` accepts either:
+      * a single string (CSV index file or directory), or
+      * a list of strings (each interpreted as above) for multi-source mixing.
+
+    When multiple sources are provided, each pair carries a ``source_id`` that
+    can be used by samplers (e.g. ``torch.utils.data.WeightedRandomSampler``)
+    to balance contributions from imbalanced datasets — essential when one
+    source (e.g. LPC) dominates and causes distribution collapse.
     """
 
     def __init__(
         self,
-        data_source: str,
+        data_source: Union[str, Sequence[str]],
         image_size: int = 64,
         augment: bool = True,
         transform: Optional[Callable] = None,
+        source_weights: Optional[Sequence[float]] = None,
     ) -> None:
         """
         Args:
-            data_source: Either a CSV index file or a directory containing
-                         *_front.png / *_back.png pairs.
+            data_source: Either a single CSV/directory or a list of them.
             image_size:  Output spatial resolution.
             augment:     Whether to apply random augmentations.
             transform:   Optional additional transform applied to (front, back)
                          tensors after the default pipeline.
         """
-        if os.path.isfile(data_source):
-            self.pairs = _load_index(data_source)
-        elif os.path.isdir(data_source):
-            self.pairs = _scan_directory(data_source)
+        if isinstance(data_source, (list, tuple)):
+            sources = list(data_source)
         else:
-            raise FileNotFoundError(
-                f"data_source must be an existing file or directory: {data_source}"
-            )
+            sources = [data_source]
+
+        self.pairs: List[Tuple[str, str]] = []
+        self.source_ids: List[int] = []
+        self.source_names: List[str] = []
+        self.source_sizes: List[int] = []
+
+        for sid, src in enumerate(sources):
+            sub_pairs = _resolve_one_source(src)
+            if not sub_pairs:
+                raise RuntimeError(f"No front/back pairs found in: {src}")
+            self.pairs.extend(sub_pairs)
+            self.source_ids.extend([sid] * len(sub_pairs))
+            self.source_names.append(str(src))
+            self.source_sizes.append(len(sub_pairs))
 
         if not self.pairs:
             raise RuntimeError(f"No front/back pairs found in: {data_source}")
@@ -131,6 +164,20 @@ class _BaseSpriteDataset(Dataset):
         self.image_size = image_size
         self.augment = augment
         self.transform = transform
+        # Optional per-source weights (floats) to bias sampling across sources.
+        if source_weights is not None:
+            if len(source_weights) != len(self.source_sizes):
+                raise ValueError("source_weights length must match number of sources")
+            self.source_weights = [float(w) for w in source_weights]
+        else:
+            self.source_weights = [1.0] * len(self.source_sizes)
+
+        # Precompute per-sample weights (aligned with self.pairs) for easy use
+        # with torch.utils.data.WeightedRandomSampler.
+        self._sample_weights = [
+            float(self.source_weights[sid]) / max(1, self.source_sizes[sid])
+            for sid in self.source_ids
+        ]
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -141,6 +188,28 @@ class _BaseSpriteDataset(Dataset):
         back = Image.open(back_path).convert("RGBA")
         return front, back
 
+    def get_sample_weights(self) -> List[float]:
+        """Return a list of per-sample weights aligned with dataset indices.
+
+        These weights are suitable to pass directly to
+        ``torch.utils.data.WeightedRandomSampler`` for balanced sampling.
+        """
+        return list(self._sample_weights)
+
+    def make_weighted_sampler(self, num_samples: Optional[int] = None, replacement: bool = True):
+        """Build a ``WeightedRandomSampler`` using the dataset's sample weights.
+
+        Args:
+            num_samples: number of samples to draw per epoch (defaults to len(dataset)).
+            replacement: whether to sample with replacement.
+        """
+        from torch.utils.data import WeightedRandomSampler
+
+        if num_samples is None:
+            num_samples = len(self)
+        weights = torch.tensor(self._sample_weights, dtype=torch.double)
+        return WeightedRandomSampler(weights, num_samples=num_samples, replacement=replacement)
+
     def _apply_augment(
         self,
         front: Image.Image,
@@ -148,6 +217,9 @@ class _BaseSpriteDataset(Dataset):
     ) -> Tuple[Image.Image, Image.Image]:
         front, back = random_horizontal_flip(front, back, p=0.5)
         front, back = random_color_jitter(front, back)
+        # Joint HSV/palette shift: applied to *both* sides so front/back stay
+        # consistent, but the LPC palette is no longer the only one seen.
+        front, back = random_palette_shift(front, back, p=0.5)
         return front, back
 
     def _to_tensor(
@@ -219,32 +291,73 @@ class FrontToBackDataset(_BaseSpriteDataset):
         "condition":    (3, H, W)  front RGB in [−1, 1] — model input
         "target":       (3, H, W)  back RGB  in [−1, 1] — reconstruction target
         "target_alpha": (1, H, W)  binary mask of back-view foreground
+        "source_id":    int        index into ``self.source_names`` — useful
+                                   for multi-source weighted sampling.
+
+    Front-only augmentations (``front_geom_jitter_p``, ``front_palette_p``,
+    ``front_bg_replace_p``) deliberately decouple the front from the back so
+    the network cannot learn a per-pixel "copy front, paint back" shortcut.
+    Disable them on the validation set by passing ``augment=False``.
     """
 
     def __init__(
         self,
-        data_source: str,
+        data_source: Union[str, Sequence[str]],
         image_size: int = 64,
         augment: bool = True,
-        occlusion_p: float = 0.3,
+        occlusion_p: float = 0.5,
+        front_geom_jitter_p: float = 0.7,
+        front_palette_p: float = 0.5,
+        front_bg_replace_p: float = 0.4,
+        occlusion_intensity: float = 0.5,
+        occlusion_fill: str = "zero",
         transform: Optional[Callable] = None,
+        source_weights: Optional[Sequence[float]] = None,
     ) -> None:
-        super().__init__(data_source, image_size, augment, transform)
+        super().__init__(data_source, image_size, augment, transform, source_weights=source_weights)
         self.occlusion_p = occlusion_p
+        self.front_geom_jitter_p = front_geom_jitter_p
+        self.front_palette_p = front_palette_p
+        self.front_bg_replace_p = front_bg_replace_p
+        self.occlusion_intensity = occlusion_intensity
+        self.occlusion_fill = occlusion_fill
 
     def __getitem__(self, idx: int):  # type: ignore[override]
         front_img, back_img = self._load_pair(idx)
 
         if self.augment:
+            # Joint augmentations (keep front/back semantically aligned).
             front_img, back_img = self._apply_augment(front_img, back_img)
-            front_img = random_occlusion(front_img, p=self.occlusion_p)
 
-        cond_t, target_t, _, target_alpha = self._to_tensor(front_img, back_img)
+            # Front-only augmentations — break the copy-shortcut.
+            front_img = random_occlusion(
+                front_img,
+                p=self.occlusion_p,
+                intensity=getattr(self, "occlusion_intensity", 0.5),
+                fill=getattr(self, "occlusion_fill", "zero"),
+            )
+            front_img = front_only_geometric_jitter(
+                front_img, p=self.front_geom_jitter_p
+            )
+            front_img = front_only_palette_perturb(
+                front_img, p=self.front_palette_p
+            )
+
+        cond_t, target_t, cond_alpha, target_alpha = self._to_tensor(front_img, back_img)
 
         # Task 2 使用 RGB 条件/目标，避免与配置中的 6=3+3 输入通道不一致。
         # alpha 作为独立 mask 返回，不丢失前景位置信息。
         cond_t = cond_t[:3, :, :]
         target_t = target_t[:3, :, :]
+
+        # Tensor-stage front-only background replacement. Done *after*
+        # premultiply so the random background actually survives into the
+        # final RGB tensor (PIL-stage replacement would be re-zeroed by
+        # the alpha-premultiply inside _rgba_to_rgba_tensor).
+        if self.augment and self.front_bg_replace_p > 0.0:
+            cond_t = front_only_background_noise_tensor(
+                cond_t, cond_alpha, p=self.front_bg_replace_p
+            )
 
         if self.transform is not None:
             cond_t, target_t = self.transform(cond_t, target_t)
@@ -253,6 +366,7 @@ class FrontToBackDataset(_BaseSpriteDataset):
             "condition": cond_t,
             "target": target_t,
             "target_alpha": target_alpha,
+            "source_id": int(self.source_ids[idx]),
         }
 
 

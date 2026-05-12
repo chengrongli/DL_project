@@ -8,6 +8,12 @@ data:
   val_dir:     "data/processed/task2/index_val.csv"
   image_size:  64
   occlusion_p: 0.3     # probability of applying random occlusion augmentation
+  occlusion_intensity: 0.5  # [0,1] intensity scaling for occlusion size/fill
+  occlusion_fill: "zero"  # one of: zero, noise, color
+  # Optional: per-source sampling weights (list aligned with data_source list)
+  # source_weights: [1.0, 0.5]
+  # Optional separate OOD validation set directory or index file
+  # ood_val_dir: "data/processed/task2/ood_index.csv"
 
 model:
   # U-Net input = noisy back (3) + front condition (3) = 6 channels
@@ -37,6 +43,17 @@ training:
   weight_decay:     1.0e-4
   mixed_precision:  true
 
+  # Classifier-Free Guidance training: randomly drop conditioning image
+  cond_drop_prob: 0.05
+
+  # EMA (exponential moving average) for model weights
+  ema:
+    enabled: true
+    decay: 0.9999
+
+  # Use dataset-provided sample weights (see data.source_weights)
+  use_weighted_sampler: false
+
   # Discriminator fine-tuning (optional)
   # Enable after the diffusion model has converged to add sharpness.
   use_discriminator: false
@@ -48,8 +65,8 @@ training:
   bg_weight:     0.5    # background pixel weight
   color_weight:  1.0    # front-back color consistency weight
 
-  val_every:    5
-  save_every:   10
-  sample_every: 10
+  val_every:    25
+  save_every:   50
+  sample_every: 50
 
   out_dir: "outputs/task2"
