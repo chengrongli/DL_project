@@ -27,52 +27,20 @@
 
 推荐 **Python ≥ 3.10 + CUDA 11.8**（在 A 系列 / 30 系 / 40 系卡都验证过）。
 
-### 用 conda（推荐）
+### 用 conda
 
 ```bash
 conda env create -f environment.yml
 conda activate oenv
 ```
 
-### 或者用 pip
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install --upgrade pip
-pip install \
-  "torch==2.3.0" "torchvision==0.18.0" --index-url https://download.pytorch.org/whl/cu118
-pip install \
-  pillow numpy scipy tqdm pyyaml einops accelerate matplotlib \
-  tensorboard scikit-image lpips requests flask
-```
-
-### 自检
-
-```bash
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-```
-
-输出形如 `2.3.0 True` 就可以。
-
 ---
 
 ## 1. 准备原始数据（front / back PNG 配对）
 
 两个任务**共享同一份原始数据**——每个角色一组 `*_front.png` / `*_back.png`，64×64 RGBA。
-有三种获取方式，任选其一即可。
 
-### 方式 A：你已经有配对数据
-
-如果某个目录下已经有 `*_front.png` / `*_back.png`（例如本机已生成的
-`data/pairs/random_batch/`），直接跳到 [第 2 步](#2-数据预处理生成训练用-csv-索引)。
-
-确认一下数量：
-
-```bash
-ls data/pairs/random_batch/*_front.png | wc -l
-```
-
-### 方式 B：从 LPC 上游仓库稀疏克隆 + 随机合成（推荐，从零生成）
+### 从 LPC 上游仓库稀疏克隆 + 随机合成
 
 1. **稀疏克隆 LPC 素材仓库**（只下身体 / 头发 / 衣服等需要的目录）：
 
@@ -99,7 +67,7 @@ ls data/pairs/random_batch/*_front.png | wc -l
 
    > 想先看看素材池规模，可以加 `--report-only` 只打印每组层数。
 
-### 方式 C：从已有 LPC 仓库抽取每张 spritesheet 的 idle 帧
+### 从已有 LPC 仓库抽取每张 spritesheet 的 idle 帧
 
 适用于你已经手动 clone 了 LPC 仓库、或者只想要“原版 spritesheet 的 front/back”而不是随机合成：
 
