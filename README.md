@@ -1,29 +1,16 @@
-
 # DL Project — LPC Character Generator
-
 
 基于 [Universal LPC Spritesheet Character Generator](https://sanderfrenken.github.io/Universal-LPC-Spritesheet-Character-Generator/)
 的像素角色生成项目，包含两个任务：
 
-
 - **Task 1 — 前后视图联合生成（Flow Matching）**：从噪声同时生成一对配对的正面 / 背面像素角色。
 - **Task 2 — 前视图到背视图重建（Conditional Diffusion）**：给定正面图，条件扩散模型预测对应的背面图。
-
-
-
-
-
-
-
-
 
 下面的步骤假设你拿到的是一个**只包含代码、不包含数据和权重**的全新仓库，按顺序跑就能从零到训练完成。
 
 ---
 
-
 ## 目录
-
 
 - [0. 环境准备](#0-环境准备)
 - [1. 准备原始数据（front / back PNG 配对）](#1-准备原始数据front--back-png-配对)
@@ -33,8 +20,6 @@
 - [5. （可选）Web Demo](#5-可选web-demo)
 - [6. 仓库结构](#6-仓库结构)
 - [7. 常见问题](#7-常见问题)
-
-
 
 ---
 
@@ -49,9 +34,7 @@ conda env create -f environment.yml
 conda activate oenv
 ```
 
-
 ### 或者用 pip
-
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -139,19 +122,14 @@ python -m data_code.repo_extractor \
 
 ```bash
 python -m data_code.agent_preprocess \
-
   --input-dir  data/pairs/random_batch \
   --output-dir data/processed/task1 \
   --image-size 64 \
-
   --val-ratio  0.1 \
   --seed       42
 ```
 
-
 ### Task 2 用的索引
-
-
 
 Task 2 可以**直接复用 Task 1 的索引**（两者读的都是 `front_path,back_path` 两列 CSV），
 也可以单独再生成一份保持目录干净：
@@ -165,16 +143,8 @@ python -m data_code.agent_preprocess \
   --seed       42
 ```
 
-
 > 如果想复用 Task 1 的 csv，把 `configs/task2_config.yaml` 里 `data.train_dir` /
 > `data.val_dir` 改成 `data/processed/task1/index_train.csv` 等即可。
-
-
-
-
-
-
-
 
 预处理产物（每个 `output-dir` 下）：
 
@@ -199,7 +169,6 @@ python -m utils.visualize_preprocessed \
 ```
 
 ---
-
 
 ## 3. Task 1 — 训练 & 采样
 
@@ -374,9 +343,6 @@ python app.py
 
 ```text
 configs/
-
-
-
 ├── task1_config.yaml          # Task1 (Flow Matching) 配置
 └── task2_config.yaml          # Task2 (Conditional Diffusion) 配置
 
@@ -393,10 +359,6 @@ data_code/
 └── convert_data_other.py      # 备用：其它格式转换
 
 models/
-
-
-
-
 ├── flow_matching.py           # Task1 — Flow Matching 框架
 ├── flow_unet.py               # Task1 — 4ch RGBA UNet
 ├── diffusion.py               # Task2 — GaussianDiffusion (DDPM/DDIM)
@@ -405,16 +367,10 @@ models/
 └── embeddings.py              # 可选属性 embedding
 
 train/
-
-
-
 ├── train_task1.py             # Task1 训练入口（Flow Matching）
 └── train_task2.py             # Task2 训练入口（Cond. Diffusion）
 
 inference/
-
-
-
 ├── generate.py                # Task1 采样（转发到 Flow 采样器）
 ├── generate_flow.py           # Task1 采样实现
 └── reconstruct.py             # Task2 前→后重建
@@ -430,11 +386,7 @@ static/                         # demo 前端
 
 ---
 
-
 ## 7. 常见问题
-
-
-
 
 **Q1. `FileNotFoundError: data_source must be an existing file or directory: data/processed/task2/index_train.csv`**
 
@@ -468,7 +420,6 @@ MPS 下保持 `false` 即可。
 ---
 
 ## References
-
 
 - Lipman et al., *Flow Matching for Generative Modeling*, ICLR 2023.
 - Ho et al., *Denoising Diffusion Probabilistic Models*, NeurIPS 2020.
