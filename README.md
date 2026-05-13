@@ -1,10 +1,11 @@
 # DL Project — LPC Character Generator
 
 基于 [Universal LPC Spritesheet Character Generator](https://sanderfrenken.github.io/Universal-LPC-Spritesheet-Character-Generator/)
-的像素角色生成项目，包含两个任务：
+的像素角色生成项目，包含两个主任务 + 一个高清一致性实验路径：
 
 - **Task 1 — 前后视图联合生成（Flow Matching）**：从噪声同时生成一对配对的正面 / 背面像素角色。
 - **Task 2 — 前视图到背视图重建（Conditional Diffusion）**：给定正面图，条件扩散模型预测对应的背面图。
+- **HD Consistency + Pixelization（实验）**：先在高清 front/back 数据上训练正背一致性 LoRA，再在推理阶段外挂 ControlNet-Tile 或可微像素化层。见 `hd_consistency_pixel/README.md`。
 
 下面的步骤假设你拿到的是一个**只包含代码、不包含数据和权重**的全新仓库，按顺序跑就能从零到训练完成。
 
