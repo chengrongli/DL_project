@@ -56,17 +56,19 @@ conda activate oenv
 2. **随机合成 N 个角色**，自动抽取每张 spritesheet 第 0 列的 idle front（行 2）/ back（行 0）：
 
    ```bash
-   python -m data_code.random_composer \
-     --assets-root data/raw_lpc_repo \
-     --out-dir     data/pairs/random_batch \
-     --count       30000 \
-     --seed        42 \
-     --num-workers 0          # 0 = 自动用 (CPU-1) 个进程
+    python -m data_code.random_composer \
+      --assets-root data/raw_lpc_repo \
+      --out-dir     data/pairs/random_batch \
+      --count       30000 \
+      --seed        42 \
+      --num-workers 0          # 0 = 自动优先单进程（更强去重/多样性与缓存复用）
    ```
 
    产物：`data/pairs/random_batch/char_0000_front.png`、`char_0000_back.png`、…
 
-   > 想先看看素材池规模，可以加 `--report-only` 只打印每组层数。
+   > 想先看看素材池规模，可以加 `--report-only` 只打印每组层数。  
+   > `random_composer` 默认会纳入 weapon/shield/backpack/quiver/tools/cape/hands/shadow 等分层；也可用 `--diversity-strength`（0~1）调节多样性偏好。  
+   > 默认会加强脸部可见性与前后一致性过滤、偏好眼镜与 helmet；`backpack_cargo` 只会在已有 backpack 时出现，并启用适度配色扰动提升发色/衣服色彩多样性。
 
 ### 从已有 LPC 仓库抽取每张 spritesheet 的 idle 帧
 
