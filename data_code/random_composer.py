@@ -10,6 +10,8 @@ manual layer stack utility, but removes the need to hand-write YAML.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import random
 from concurrent.futures import ProcessPoolExecutor
 from collections import defaultdict
@@ -28,7 +30,7 @@ DEFAULT_LAYER_ORDER: Sequence[str] = (
     "shadow",
     "body",
     "tail",
-    "wings",
+    # "wings",    # banned: front/back asymmetry
     "legs",
     "feet",
     "torso",
@@ -47,18 +49,45 @@ DEFAULT_LAYER_ORDER: Sequence[str] = (
     "backpack_cargo",
     "quiver",
     "shield",
-    "weapon",
-    "tools",
+    # "weapon",   # banned: inconsistent facing direction
+    # "tools",    # banned: same issue
 )
 
 REQUIRED_GROUPS: Set[str] = {"body", "legs", "feet", "torso", "head"}
+
+# Z-order for compositing: lower = drawn first (further back).
+# Groups not listed default to 50 (mid-layer).
+GROUP_Z_ORDER: Dict[str, int] = {
+    "shadow": 0,
+    "hair_bg": 5,       # long hair behind body
+    "body": 10,
+    "tail": 15,
+    "legs": 20,
+    "feet": 25,
+    "torso": 35,
+    "dress": 40,
+    "arms": 50,
+    "hands": 55,
+    "neck": 60,
+    "head": 70,
+    "eyes": 75,
+    "facial": 80,
+    "hair": 85,
+    "hat": 90,
+    "shoulders": 95,
+    "cape": 100,
+    "backpack": 105,
+    "backpack_cargo": 106,
+    "quiver": 110,
+    "shield": 115,
+}
 GROUP_SAMPLING_PROB: Dict[str, float] = {
     "shadow": 1.0,
     "dress": 0.22,
     "arms": 0.32,
     "hands": 0.52,
     "neck": 0.45,
-    "eyes": 1.0,     # 眼睛强制保留，避免“无脸感”
+    "eyes": 1.0,     # 眼睛强制保留，避免"无脸感"
     "facial": 0.5,   # 提高面部配件出现率（含眼镜）
     "hair": 0.9,
     "hat": 0.30,     # 提升帽子出现率，配合 helmet 偏好
@@ -74,7 +103,7 @@ GROUP_SAMPLING_PROB: Dict[str, float] = {
     "wings": 0.03,
 }
 
-# 避免随机到残缺/伤残层，生成“缺胳膊少腿”的异常角色。
+# 避免随机到残缺/伤残层，生成"缺胳膊少腿"的异常角色。
 PATH_BLOCKLIST = (
     "wound",
     "prosthesis",
@@ -86,7 +115,7 @@ PATH_BLOCKLIST = (
 
 GROUP_BLOCKLIST: Dict[str, Sequence[str]] = {
     "body": ("skeleton", "zombie"),
-    # 脸部优先“正常人像”
+    # 脸部优先"正常人像"
     "head": (
         "alien", "boarman", "frankenstein", "goblin", "jack", "lizard",
         "minotaur", "mouse", "orc", "pig", "rabbit", "rat", "sheep",
@@ -104,6 +133,13 @@ GROUP_BLOCKLIST: Dict[str, Sequence[str]] = {
         "long_band",
         "longhawk",
         "topknot_short",
+        "half_up",
+        "loose",
+        "shoulderl",
+        "shoulderr",
+        "single",
+        "extensions",
+        "idol",
     ),
     "hat": ("horns", "skull", "bone", "mask"),
     "cape": ("solid_behind", "tattered_behind"),
@@ -114,7 +150,12 @@ BODY_COMPAT_TOKENS = (
     "male", "female", "teen", "child", "muscular", "pregnant", "adult", "lizard",
     "small", "elderly", "gaunt", "plump",
 )
+
 STRICT_BODY_COMPAT_GROUPS: Set[str] = {"head", "eyes", "hair", "neck", "torso", "legs", "feet", "dress", "shadow"}
+
+# Torso subfolders that only cover the waist area (belts, bandages, aprons).
+# Female bodies should not use these as the sole torso layer.
+_TORSO_MINIMAL_SUBFOLDERS: Set[str] = {"aprons", "bandage", "waist"}
 
 def _walk_patterns(prefix: str) -> Sequence[str]:
     # 同时覆盖:
@@ -130,7 +171,7 @@ LAYER_PATTERNS: Dict[str, Sequence[str]] = {
     "torso": _walk_patterns("spritesheets/torso"),
     "legs": _walk_patterns("spritesheets/legs"),
     "feet": _walk_patterns("spritesheets/feet"),
-    # 头部限定到 heads，避免随机到“只有耳朵/附加件”导致脸异常
+    # 头部限定到 heads，避免随机到"只有耳朵/附加件"导致脸异常
     "head": _walk_patterns("spritesheets/head/heads/human"),
     "hair": _walk_patterns("spritesheets/hair"),
     # 眼睛限定 human 子集，剔除 cyclops
@@ -191,19 +232,46 @@ GROUP_DEPENDENCIES: Dict[str, Set[str]] = {
     "backpack_cargo": {"backpack"},
 }
 
+# Raw color tokens found in LPC asset paths — used for path-based extraction.
 COLOR_TOKENS: Tuple[str, ...] = (
     "bluegray", "charcoal", "lavender", "maroon", "purple", "orange", "yellow",
     "green", "forest", "teal", "navy", "blue", "sky", "red", "pink", "rose",
     "brown", "leather", "walnut", "gray", "black", "white", "gold", "silver",
     "copper", "bronze", "iron", "steel", "tin",
+    "slate", "crimson", "peach", "coral", "tan", "cream", "olive", "amber",
 )
-NEUTRAL_COLORS: Set[str] = {"black", "white", "gray", "charcoal", "silver", "iron", "steel", "tin", "leather", "walnut", "brown"}
+# Normalise raw tokens to 15 simplified colours for training.
+COLOR_NORMALIZE: Dict[str, str] = {
+    "bluegray": "blue", "charcoal": "gray", "lavender": "purple", "maroon": "red",
+    "forest": "green", "navy": "blue", "sky": "blue", "rose": "red",
+    "leather": "brown", "walnut": "brown", "iron": "silver", "steel": "silver",
+    "tin": "silver", "bronze": "copper",
+    "slate": "gray", "crimson": "red", "peach": "pink", "coral": "red",
+    "tan": "brown", "cream": "white", "olive": "green", "amber": "orange",
+}
+SIMPLIFIED_COLORS: Tuple[str, ...] = (
+    "black", "white", "gray", "brown", "red", "pink", "orange", "yellow",
+    "green", "teal", "blue", "purple", "gold", "silver", "copper",
+)
+NEUTRAL_COLORS: Set[str] = {"black", "white", "gray", "silver", "brown"}
+
+# Torso subfolder → merged torso type
+TORSO_TYPE_MAP: Dict[str, str] = {
+    "clothes": "clothes",
+    "jacket": "jacket",
+    "armour": "armour",
+    "chainmail": "armour",
+    "aprons": "bare",
+    "bandage": "bare",
+    "waist": "bare",
+}
+
 COLOR_FAMILY: Dict[str, str] = {
-    "blue": "cool", "navy": "cool", "sky": "cool", "bluegray": "cool", "teal": "cool", "green": "cool", "forest": "cool",
-    "purple": "cool", "lavender": "cool",
-    "red": "warm", "orange": "warm", "yellow": "warm", "pink": "warm", "rose": "warm", "maroon": "warm",
-    "gold": "metal", "bronze": "metal", "copper": "metal", "silver": "metal", "iron": "metal", "steel": "metal", "tin": "metal",
-    "black": "neutral", "white": "neutral", "gray": "neutral", "charcoal": "neutral", "brown": "earth", "leather": "earth", "walnut": "earth",
+    "blue": "cool", "teal": "cool", "green": "cool",
+    "purple": "cool",
+    "red": "warm", "orange": "warm", "yellow": "warm", "pink": "warm",
+    "gold": "metal", "silver": "metal", "copper": "metal",
+    "black": "neutral", "white": "neutral", "gray": "neutral", "brown": "earth",
 }
 CLOTH_COLOR_GROUPS: Set[str] = {"torso", "dress", "legs", "feet", "cape", "hat", "backpack", "backpack_cargo"}
 STRICT_OBJECT_GROUPS: Set[str] = {"weapon", "tools", "shield", "quiver", "backpack", "backpack_cargo", "cape"}
@@ -227,10 +295,362 @@ REPAIR_REMOVAL_PRIORITY: Tuple[str, ...] = (
 )
 
 
+def _normalize_color(raw: Optional[str]) -> Optional[str]:
+    if raw is None:
+        return None
+    return COLOR_NORMALIZE.get(raw, raw)
+
+
+# Fine-grained hair folder names → 14 simplified categories.
+HAIR_STYLE_MAP: Dict[str, str] = {
+    "buzzcut": "short", "flat_top_fade": "short", "flat_top_straight": "short",
+    "shorthawk": "short", "pixie": "short", "high_and_tight": "short",
+    "balding": "short", "relm_short": "short",
+    "bob": "medium", "bob_side_part": "medium", "page": "medium", "page2": "medium",
+    "plain": "medium", "lob": "medium", "sara": "medium", "natural": "medium",
+    "long": "long", "long_straight": "long", "long_center_part": "long",
+    "long_messy": "long", "long_messy2": "long", "long_tied": "long",
+    "long_band": "long", "xlong": "long", "wavy": "long", "xlong_wavy": "long",
+    "curtains_long": "long", "relm_xlong": "long",
+    "ponytail": "ponytail", "ponytail2": "ponytail", "high_ponytail": "ponytail",
+    "relm_ponytail": "ponytail",
+    "braid": "braid", "braid2": "braid",
+    "curly_long": "curly", "curly_short": "curly", "curly_short2": "curly",
+    "curls_large": "curly", "curls_large_xlong": "curly", "afro": "curly",
+    "jewfro": "curly",
+    "spiked": "spiked", "spiked2": "spiked", "spiked_beehive": "spiked",
+    "spiked_liberty": "spiked", "spiked_liberty2": "spiked",
+    "spiked_porcupine": "spiked", "longhawk": "spiked",
+    "bangs": "bangs", "bangslong": "bangs", "bangslong2": "bangs",
+    "bangsshort": "bangs", "parted_side_bangs": "bangs",
+    "parted_side_bangs2": "bangs",
+    "pigtails": "pigtails", "pigtails_bangs": "pigtails", "bunches": "pigtails",
+    "dreadlocks_long": "dreadlocks", "dreadlocks_short": "dreadlocks",
+    "cornrows": "dreadlocks", "twists_fade": "dreadlocks",
+    "twists_straight": "dreadlocks",
+    "messy": "messy", "messy1": "messy", "messy2": "messy", "messy3": "messy",
+    "bedhead": "messy", "unkempt": "messy", "halfmessy": "messy",
+    "cowlick": "messy", "cowlick_tall": "messy", "mop": "messy",
+    "parted": "parted", "parted2": "parted", "parted3": "parted",
+    "curtains": "parted", "swoop": "parted", "swoop_side": "parted",
+    "bangs_bun": "bun", "princess": "bun",
+}
+
+LEGS_TYPE_MAP: Dict[str, str] = {
+    "pants": "pants", "pants2": "pants",
+    "formal": "pants", "formal_striped": "pants", "cuffed": "pants",
+    "pantaloons": "pants",
+    "shorts": "shorts",
+    "skirts": "skirt",
+    "leggings": "leggings", "leggings2": "leggings", "hose": "leggings",
+    "armour": "armour", "fur": "armour",
+}
+
+FEET_TYPE_MAP: Dict[str, str] = {
+    "boots": "boots",
+    "shoes": "shoes", "slippers": "shoes", "socks": "shoes", "accessory": "shoes",
+    "sandals": "sandals",
+    "armour": "armour", "hoofs": "armour",
+}
+
+
+def _extract_hair_style(path: Path) -> Optional[str]:
+    parts = [p.lower() for p in path.parts]
+    for i, p in enumerate(parts):
+        if p == "hair" and i + 1 < len(parts):
+            return HAIR_STYLE_MAP.get(parts[i + 1], parts[i + 1])
+    return None
+
+
+def _extract_torso_subfolder(path: Path) -> Optional[str]:
+    parts = [p.lower() for p in path.parts]
+    for i, p in enumerate(parts):
+        if p == "torso" and i + 1 < len(parts):
+            return parts[i + 1]
+    return None
+
+
+def _extract_legs_subfolder(path: Path) -> Optional[str]:
+    parts = [p.lower() for p in path.parts]
+    for i, p in enumerate(parts):
+        if p == "legs" and i + 1 < len(parts):
+            return parts[i + 1]
+    return None
+
+
+def _extract_feet_subfolder(path: Path) -> Optional[str]:
+    parts = [p.lower() for p in path.parts]
+    for i, p in enumerate(parts):
+        if p == "feet" and i + 1 < len(parts):
+            return parts[i + 1]
+    return None
+
+
+def _detect_skin_color(body_path: Path) -> Optional[str]:
+    """Detect skin color from the body layer by sampling the torso region."""
+    try:
+        sheet = load_spritesheet(str(body_path))
+        body_front, _ = extract_front_back(sheet)
+    except Exception:
+        return None
+
+    arr = np.array(body_front.convert("RGBA"))
+    alpha = arr[:, :, 3] > 128
+
+    h, w = alpha.shape
+    top = h // 3
+    bot = 2 * h // 3
+    region = np.zeros_like(alpha)
+    region[top:bot, :] = True
+    mask = alpha & region
+
+    if not mask.any():
+        mask = alpha
+
+    pixels = arr[mask][:, :3].astype(float)
+    if len(pixels) == 0:
+        return None
+
+    brightness = pixels.mean(axis=1)
+    keep = (brightness > 20) & (brightness < 240)
+    pixels = pixels[keep]
+    if len(pixels) == 0:
+        return None
+
+    median_rgb = np.median(pixels, axis=0)
+
+    best_color = None
+    best_dist = float("inf")
+    for name, ref in _SIMPLIFIED_COLOR_RGB.items():
+        d = sum((float(median_rgb[i]) - ref[i]) ** 2 for i in range(3))
+        if d < best_dist:
+            best_dist = d
+            best_color = name
+    return best_color
+
+
+def _extract_attributes(chosen_layers: List[LayerChoice]) -> dict:
+    attrs: dict = {
+        "body_type": "adult",
+        "hair_color": None,
+        "hair_style": None,
+        "torso_type": "bare",
+        "torso_color": None,
+        "legs_type": "pants",
+        "legs_color": None,
+        "feet_type": "shoes",
+        "feet_color": None,
+    }
+    body_path = None
+    has_dress = False
+    for layer in chosen_layers:
+        g = layer.group
+        p = layer.path
+        if g == "body":
+            style = _infer_body_style(p)
+            attrs["body_type"] = "adult" if style == "pregnant" else style
+            body_path = p
+        elif g == "hair":
+            attrs["hair_color"] = None  # filled later by pixel detection
+            attrs["hair_style"] = _extract_hair_style(p)
+        elif g == "torso":
+            raw_sub = _extract_torso_subfolder(p)
+            torso_type = TORSO_TYPE_MAP.get(raw_sub, "bare")
+            attrs["torso_type"] = torso_type
+            if torso_type != "bare":
+                attrs["torso_color"] = _normalize_color(_extract_color_token(p))
+        elif g == "legs":
+            raw_sub = _extract_legs_subfolder(p)
+            attrs["legs_type"] = LEGS_TYPE_MAP.get(raw_sub, "pants")
+            attrs["legs_color"] = _normalize_color(_extract_color_token(p))
+        elif g == "feet":
+            raw_sub = _extract_feet_subfolder(p)
+            attrs["feet_type"] = FEET_TYPE_MAP.get(raw_sub, "shoes")
+            attrs["feet_color"] = _normalize_color(_extract_color_token(p))
+        elif g == "dress":
+            has_dress = True
+
+    # Dress covers the legs area.
+    if has_dress:
+        attrs["legs_type"] = "dress"
+
+    if attrs["torso_type"] == "bare" and body_path is not None:
+        attrs["torso_color"] = _detect_skin_color(body_path)
+
+    return attrs
+
+
 @dataclass(frozen=True)
 class LayerChoice:
     group: str
     path: Path
+
+
+def _rotate_tile_hue(tile: Image.Image, hue_delta: float) -> Image.Image:
+    """Rotate hue of all non-transparent pixels in a single tile."""
+    import numpy as np
+
+    rgba = np.array(tile.convert("RGBA"))
+    mask = rgba[:, :, 3] > 0
+    if not mask.any():
+        return tile
+
+    pixels = rgba[mask, :3].astype(np.float32) / 255.0
+    r, g, b = pixels[:, 0], pixels[:, 1], pixels[:, 2]
+    cmax = np.maximum(np.maximum(r, g), b)
+    cmin = np.minimum(np.minimum(r, g), b)
+    delta = cmax - cmin
+    v = cmax
+    s = np.where(cmax > 1e-6, delta / cmax, 0.0)
+
+    h = np.zeros_like(r)
+    mr = (cmax == r) & (delta > 1e-6)
+    mg = (cmax == g) & (delta > 1e-6) & ~mr
+    mb = (cmax == b) & (delta > 1e-6) & ~mr & ~mg
+    h[mr] = ((g[mr] - b[mr]) / delta[mr]) % 6.0
+    h[mg] = ((b[mg] - r[mg]) / delta[mg]) + 2.0
+    h[mb] = ((r[mb] - g[mb]) / delta[mb]) + 4.0
+    h /= 6.0
+    h = (h + hue_delta) % 1.0
+
+    i = (h * 6.0).astype(int) % 6
+    f = (h * 6.0) - np.floor(h * 6.0)
+    p = v * (1.0 - s)
+    q = v * (1.0 - s * f)
+    t = v * (1.0 - s * (1.0 - f))
+
+    rgb = np.zeros_like(pixels)
+    for idx, (rv, gv, bv) in enumerate([(v,t,p), (q,v,p), (p,v,t), (p,q,v), (t,p,v), (v,p,q)]):
+        sel = i == idx
+        rgb[sel, 0] = rv[sel]
+        rgb[sel, 1] = gv[sel]
+        rgb[sel, 2] = bv[sel]
+
+    rgba[mask, :3] = (rgb * 255).clip(0, 255).astype(np.uint8)
+    return Image.fromarray(rgba, mode="RGBA")
+
+
+def _rotate_hair_hue(
+    img: Image.Image,
+    hair_path: Path,
+    hue_delta: float,
+    column: int = 0,
+    tile_cache: Optional[Dict] = None,
+    is_back: bool = False,
+) -> Image.Image:
+    """Rotate hue of hair pixels only in the composed image."""
+    import numpy as np
+
+    sheet = load_spritesheet(str(hair_path))
+    hair_front, hair_back = extract_front_back(sheet)
+    hair_tile = hair_back if is_back else hair_front
+
+    hair_alpha = np.array(hair_tile.getchannel("A")) > 0
+    if not hair_alpha.any():
+        return img
+
+    rgba = np.array(img.convert("RGBA"))
+    mask = hair_alpha & (rgba[:, :, 3] > 0)
+    if not mask.any():
+        return img
+
+    pixels = rgba[mask, :3].astype(np.float32) / 255.0
+
+    # Vectorised HSV hue rotation using numpy
+    r, g, b = pixels[:, 0], pixels[:, 1], pixels[:, 2]
+    cmax = np.maximum(np.maximum(r, g), b)
+    cmin = np.minimum(np.minimum(r, g), b)
+    delta = cmax - cmin
+
+    # Value
+    v = cmax
+    # Saturation
+    s = np.where(cmax > 0, delta / cmax, 0.0)
+    # Hue
+    h = np.zeros_like(r)
+    mask_r = (cmax == r) & (delta > 0)
+    mask_g = (cmax == g) & (delta > 0) & ~mask_r
+    mask_b = (cmax == b) & (delta > 0) & ~mask_r & ~mask_g
+    h[mask_r] = ((g[mask_r] - b[mask_r]) / delta[mask_r]) % 6.0
+    h[mask_g] = ((b[mask_g] - r[mask_g]) / delta[mask_g]) + 2.0
+    h[mask_b] = ((r[mask_b] - g[mask_b]) / delta[mask_b]) + 4.0
+    h /= 6.0  # normalise to [0, 1]
+
+    h = (h + hue_delta) % 1.0
+
+    # HSV to RGB (vectorised)
+    i = (h * 6.0).astype(int) % 6
+    f = (h * 6.0) - np.floor(h * 6.0)
+    p = v * (1.0 - s)
+    q = v * (1.0 - s * f)
+    t = v * (1.0 - s * (1.0 - f))
+
+    rgb = np.zeros_like(pixels)
+    for idx, (rv, gv, bv) in enumerate([(v,t,p), (q,v,p), (p,v,t), (p,q,v), (t,p,v), (v,p,q)]):
+        sel = i == idx
+        rgb[sel, 0] = rv[sel]
+        rgb[sel, 1] = gv[sel]
+        rgb[sel, 2] = bv[sel]
+
+    rgba[mask, :3] = (rgb * 255).clip(0, 255).astype(np.uint8)
+    return Image.fromarray(rgba, mode="RGBA")
+
+
+def _detect_hair_color(front_img: Image.Image, hair_path: Path) -> Optional[str]:
+    """Detect hair colour from the composed front image using the hair tile alpha mask."""
+    import numpy as np
+
+    try:
+        sheet = load_spritesheet(str(hair_path))
+        hair_tile, _ = extract_front_back(sheet)
+    except Exception:
+        return None
+
+    hair_arr = np.array(hair_tile.convert("RGBA"))
+    hair_alpha = hair_arr[:, :, 3] > 128
+    if not hair_alpha.any():
+        return None
+
+    front_arr = np.array(front_img.convert("RGBA").resize(hair_tile.size, Image.NEAREST))
+    pixels = front_arr[hair_alpha][:, :3].astype(float)
+
+    if len(pixels) == 0:
+        return None
+
+    # Filter out extreme shadows / highlights
+    brightness = pixels.mean(axis=1)
+    mask = (brightness > 20) & (brightness < 240)
+    pixels = pixels[mask]
+    if len(pixels) == 0:
+        return None
+
+    # Median colour
+    median_rgb = np.median(pixels, axis=0)
+
+    # Map to nearest simplified colour using Lab distance
+    try:
+        from colorsys import rgb_to_lab_approx
+    except ImportError:
+        pass
+
+    # Simple RGB distance fallback — good enough for 15 coarse categories
+    best_color = None
+    best_dist = float("inf")
+    for name, ref in _SIMPLIFIED_COLOR_RGB.items():
+        d = sum((float(median_rgb[i]) - ref[i]) ** 2 for i in range(3))
+        if d < best_dist:
+            best_dist = d
+            best_color = name
+    return best_color
+
+
+_SIMPLIFIED_COLOR_RGB: Dict[str, Tuple[int, int, int]] = {
+    "black": (30, 30, 30), "white": (235, 235, 235), "gray": (128, 128, 128),
+    "brown": (139, 90, 43), "red": (200, 30, 30), "pink": (255, 150, 180),
+    "orange": (230, 130, 30), "yellow": (230, 220, 50), "green": (50, 160, 50),
+    "teal": (0, 160, 160), "blue": (50, 80, 200), "purple": (140, 50, 180),
+    "gold": (220, 180, 40), "silver": (180, 180, 190), "copper": (180, 100, 50),
+}
 
 
 def _is_blocked_path(path: Path) -> bool:
@@ -239,9 +659,12 @@ def _is_blocked_path(path: Path) -> bool:
 
 
 def _is_group_allowed(group: str, path: Path) -> bool:
-    text = str(path).lower()
+    # Match blocklist tokens against individual path PARTS using EXACT match.
+    # Substring matching on the full path string caused false positives,
+    # e.g. "rat" matching "universal-lpc-spritesheet-character-generator".
+    parts = {p.lower() for p in path.parts}
     blocked = GROUP_BLOCKLIST.get(group, ())
-    if any(token in text for token in blocked):
+    if parts.intersection(blocked):
         return False
     return not _is_problematic_one_sided_path(group, path)
 
@@ -322,37 +745,154 @@ def _build_layer_pool(assets_root: Path, groups: Sequence[str]) -> Dict[str, Lis
     return pool
 
 
+def _build_lpc_compat_index(
+    sheet_defs_root: str | Path,
+    assets_root: str | Path,
+    body_types: Sequence[str] = ("male", "female", "muscular", "teen", "child", "pregnant"),
+) -> Dict[str, Dict[str, Set[Path]]]:
+    """Build a precise body-type → allowed asset paths index from LPC sheet_definitions.
+
+    Reads every JSON file in sheet_definitions/, extracts which body types each
+    asset defines paths for, then resolves those paths against the actual asset
+    directory.
+
+    Returns: {group_name: {body_type: set_of_allowed_paths}}
+    """
+    import json as _json
+
+    defs = Path(sheet_defs_root)
+    assets = Path(assets_root)
+    result: Dict[str, Dict[str, Set[Path]]] = {}
+
+    # Map LPC sheet_definitions category names to our layer group names.
+    # Some categories (dress, jacket, shirts, etc.) all map to "torso" in our system.
+    CATEGORY_TO_GROUP = {
+        "hair": "hair",
+        "torso": "torso",
+        "legs": "legs",
+        "feet": "feet",
+        "head": "head",
+        "headwear": "hat",
+        "body": "body",
+    }
+
+    def _collect_json_files(directory: Path) -> list:
+        """Recursively collect all non-meta JSON files."""
+        out = []
+        if not directory.exists():
+            return out
+        for root, dirs, files in os.walk(directory):
+            for f in sorted(files):
+                if f.endswith(".json") and not f.startswith("meta_"):
+                    out.append(Path(root) / f)
+        return out
+
+    def _extract_paths_for_bodytype(data: dict, body_type: str, category_dir: Path) -> Set[Path]:
+        """Extract actual file paths from layer definitions for a given body type."""
+        paths = set()
+        # Check layer_1, layer_2, etc.
+        for key, val in data.items():
+            if not key.startswith("layer"):
+                continue
+            if not isinstance(val, dict):
+                continue
+            rel_path = val.get(body_type)
+            if rel_path is None:
+                continue
+            # rel_path is like "hair/bangs/adult/" — resolve to actual files
+            abs_dir = assets / rel_path
+            if abs_dir.exists():
+                for p in abs_dir.rglob("*.png"):
+                    paths.add(p.resolve())
+        return paths
+
+    # Walk each category directory
+    for category_name in ("hair", "torso", "legs", "feet", "head"):
+        cat_dir = defs / category_name
+        group = CATEGORY_TO_GROUP.get(category_name, category_name)
+
+        if group not in result:
+            result[group] = {bt: set() for bt in body_types}
+
+        for json_file in _collect_json_files(cat_dir):
+            try:
+                data = _json.load(open(json_file))
+            except Exception:
+                continue
+
+            for bt in body_types:
+                resolved = _extract_paths_for_bodytype(data, bt, cat_dir)
+                result[group][bt].update(resolved)
+
+    return result
+
+
 def _build_body_compat_pool(
     layer_pool: Dict[str, List[Path]],
     groups: Sequence[str],
 ) -> Dict[Path, Dict[str, List[Path]]]:
     body_candidates = layer_pool.get("body", [])
+
+    # Try to load LPC sheet_definitions for precise filtering
+    lpc_defs = Path(__file__).resolve().parent.parent / "Universal-LPC-Spritesheet-Character-Generator" / "sheet_definitions"
+    assets_root = layer_pool.get("body", [Path(".")])[0]
+    # Walk up to find assets root (parent of spritesheets/)
+    for p in [assets_root] + list(assets_root.parents):
+        if (p / "spritesheets").exists():
+            assets_root = p
+            break
+
+    lpc_index = None
+    if lpc_defs.exists():
+        try:
+            lpc_index = _build_lpc_compat_index(lpc_defs, assets_root / "spritesheets")
+        except Exception:
+            lpc_index = None
+
     result: Dict[Path, Dict[str, List[Path]]] = {}
     for body_path in body_candidates:
-        body_tokens = _infer_body_tokens(body_path)
         body_style = _infer_body_style(body_path)
         by_group: Dict[str, List[Path]] = {}
         for group in groups:
             candidates = layer_pool.get(group, [])
             if not candidates:
                 continue
-            compatible = _filter_compatible(
-                candidates,
-                body_tokens,
-                allow_fallback=(group not in STRICT_BODY_COMPAT_GROUPS),
-            )
+
+            compatible = candidates
+
+            # Use precise LPC index if available
+            if lpc_index is not None and group in lpc_index:
+                allowed = lpc_index[group].get(body_style, set())
+                if not allowed:
+                    # muscular shares male assets in LPC
+                    if body_style == "muscular":
+                        allowed = lpc_index[group].get("male", set())
+                    # pregnant shares female assets
+                    elif body_style == "pregnant":
+                        allowed = lpc_index[group].get("female", set())
+
+                if allowed:
+                    filtered = [c for c in candidates if c.resolve() in allowed]
+                    if filtered:
+                        compatible = filtered
+
+            # Head: additional gender-specific filtering
             if group == "head":
                 strict_head = _filter_head_compatible(compatible, body_style)
                 if strict_head:
                     compatible = strict_head
+
+            # Blocklist
+            compatible = [c for c in compatible if _is_group_allowed(group, c)]
+
             if not compatible:
                 if group in STRICT_BODY_COMPAT_GROUPS:
                     if group in REQUIRED_GROUPS:
-                        compatible = candidates
+                        compatible = [c for c in candidates if _is_group_allowed(group, c)]
                     else:
                         continue
                 else:
-                    compatible = candidates
+                    compatible = [c for c in candidates if _is_group_allowed(group, c)]
             by_group[group] = compatible
         result[body_path] = by_group
     return result
@@ -360,9 +900,11 @@ def _build_body_compat_pool(
 
 def _infer_body_style(body_path: Path) -> str:
     parts = [p.lower() for p in body_path.parts]
-    for style in ("child", "teen", "female", "male", "muscular", "pregnant"):
+    for style in ("child", "teen", "female", "male", "muscular"):
         if style in parts:
             return style
+    if "pregnant" in parts:
+        return "female"
     return "adult"
 
 
@@ -377,6 +919,8 @@ def _infer_body_tokens(body_path: Path) -> Set[str]:
         tokens.add("male")
     if "teen" in tokens:
         tokens.add("small")
+        tokens.add("adult")
+        tokens.add("male")
     return tokens
 
 
@@ -503,20 +1047,38 @@ def _choose_candidate(
     return rng.choice(least_used)
 
 
+def _shift_tile_y(tile: Image.Image, offset: int) -> Image.Image:
+    """Shift a tile up (negative) or down (positive) by *offset* pixels."""
+    w, h = tile.size
+    result = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    result.paste(tile, (0, offset))
+    return result
+
+
 def _compose_layers_cached(
     layer_paths: List[str],
     *,
     col: int,
     tile_cache: Dict[Tuple[str, int], Tuple[Image.Image, Image.Image]],
+    layer_groups: Optional[Sequence[str]] = None,
+    group_y_offsets: Optional[Dict[str, int]] = None,
 ) -> Tuple[Image.Image, Image.Image]:
     front_canvas = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     back_canvas = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
 
-    for path in layer_paths:
+    for i, path in enumerate(layer_paths):
         tiles = _get_cached_tiles(path, col=col, tile_cache=tile_cache)
+        ft, bt = tiles[0], tiles[1]
 
-        front_canvas = Image.alpha_composite(front_canvas, tiles[0])
-        back_canvas = Image.alpha_composite(back_canvas, tiles[1])
+        # Apply per-group y-offset (e.g. shift hair up for child bodies).
+        if layer_groups and group_y_offsets and i < len(layer_groups):
+            y_off = group_y_offsets.get(layer_groups[i], 0)
+            if y_off != 0:
+                ft = _shift_tile_y(ft, y_off)
+                bt = _shift_tile_y(bt, y_off)
+
+        front_canvas = Image.alpha_composite(front_canvas, ft)
+        back_canvas = Image.alpha_composite(back_canvas, bt)
 
     return front_canvas, back_canvas
 
@@ -585,6 +1147,12 @@ def _passes_hair_sanity(
     if head_layer is None or eyes_layer is None:
         return False
 
+    # Child bodies use a y-shift to reposition hair, so the raw tile
+    # overlap ratio is misleadingly high.  Skip the overlap check for
+    # child and rely on the shift + colour contrast instead.
+    body_layer = next((layer for layer in chosen_layers if layer.group == "body"), None)
+    is_child = body_layer is not None and _infer_body_style(body_layer.path) == "child"
+
     hair_front, _ = _get_cached_tiles(str(hair_layer.path), col=column, tile_cache=tile_cache)
     head_front, _ = _get_cached_tiles(str(head_layer.path), col=column, tile_cache=tile_cache)
     eyes_front, _ = _get_cached_tiles(str(eyes_layer.path), col=column, tile_cache=tile_cache)
@@ -596,15 +1164,16 @@ def _passes_hair_sanity(
     if hair_pixels > MAX_HAIR_FRONT_PIXELS:
         return False
 
-    face_mask = (np.array(head_front.getchannel("A")) > 0) | (np.array(eyes_front.getchannel("A")) > 0)
-    face_pixels = int(face_mask.sum())
-    if face_pixels <= 0:
-        return False
-    overlap = int((hair_mask & face_mask).sum())
-    if (float(overlap) / float(face_pixels)) > MAX_HAIR_FACE_OVERLAP_RATIO:
-        return False
+    if not is_child:
+        face_mask = (np.array(head_front.getchannel("A")) > 0) | (np.array(eyes_front.getchannel("A")) > 0)
+        face_pixels = int(face_mask.sum())
+        if face_pixels <= 0:
+            return False
+        overlap = int((hair_mask & face_mask).sum())
+        if (float(overlap) / float(face_pixels)) > MAX_HAIR_FACE_OVERLAP_RATIO:
+            return False
 
-    # 头发与头部基底颜色太接近时，看起来会像“光头”。
+    # 头发与头部基底颜色太接近时，看起来会像"光头"。
     hair_rgb = np.array(hair_front.convert("RGBA"))[:, :, :3]
     head_rgb = np.array(head_front.convert("RGBA"))[:, :, :3]
     head_mask = np.array(head_front.getchannel("A")) > 0
@@ -651,7 +1220,7 @@ def _passes_front_back_consistency(
                 return False
             continue
 
-        # 对衣物类组更严格：不允许明显“正面大片，背面近乎无”或反过来。
+        # 对衣物类组更严格：不允许明显"正面大片，背面近乎无"或反过来。
         if group in STRICT_CLOTH_GROUPS:
             lo = min(fa, ba)
             hi = max(fa, ba)
@@ -768,6 +1337,17 @@ def _passes_all_constraints(
     )
 
 
+def _child_hair_y_offset(chosen_layers: List[LayerChoice]) -> Optional[Dict[str, int]]:
+    """Return a y-offset dict for hair+hat if body is child, else None."""
+    body = next((l for l in chosen_layers if l.group == "body"), None)
+    if body and _infer_body_style(body.path) == "child":
+        offsets: Dict[str, int] = {"hair": -4}
+        if any(l.group == "hat" for l in chosen_layers):
+            offsets["hat"] = -4
+        return offsets
+    return None
+
+
 def _repair_layers_for_constraints(
     chosen_layers: List[LayerChoice],
     *,
@@ -781,7 +1361,12 @@ def _repair_layers_for_constraints(
         required_keep = required_keep.union({"hair"})
     while True:
         layer_paths = [str(choice.path) for choice in repaired]
-        front, back = _compose_layers_cached(layer_paths, col=column, tile_cache=tile_cache)
+        groups = [l.group for l in repaired]
+        y_off = _child_hair_y_offset(repaired)
+        front, back = _compose_layers_cached(
+            layer_paths, col=column, tile_cache=tile_cache,
+            layer_groups=groups, group_y_offsets=y_off,
+        )
         if _passes_all_constraints(repaired, front, back, column=column, tile_cache=tile_cache):
             return repaired, front, back, True
 
@@ -795,6 +1380,18 @@ def _repair_layers_for_constraints(
                 removed = True
                 break
         if not removed:
+            # Last resort for child: drop hair (child hair tiles have
+            # inherently high overlap and the y-shift may not be enough).
+            # For adults, keep hair to avoid baldness.
+            body_l = next((l for l in repaired if l.group == "body"), None)
+            is_child_body = body_l is not None and _infer_body_style(body_l.path) == "child"
+            if is_child_body:
+                hair_idx = next((i for i, item in enumerate(repaired) if item.group == "hair"), None)
+                if hair_idx is not None:
+                    repaired.pop(hair_idx)
+                    present_groups.discard("hair")
+                    required_keep.discard("hair")
+                    continue
             return repaired, front, back, False
 
 
@@ -838,6 +1435,32 @@ def summarize_layer_pool(assets_root: str, groups: Sequence[str] = DEFAULT_LAYER
     return {g: len(pool.get(g, [])) for g in groups}
 
 
+def _add_hair_bg_layer(trial: list, hair_path: Path) -> None:
+    """Add a hair_bg layer if the hair tile has a dual fg/bg structure.
+
+    LPC dual-layer hair styles have fg/ (drawn above head) and bg/ (drawn behind
+    body). If we picked a fg/ tile, find the matching bg/ tile and add it as
+    group "hair_bg". If we picked a bg/ tile, find the matching fg/ tile and
+    swap it into "hair" while the bg/ becomes "hair_bg".
+    """
+    p = hair_path
+    parts = [x.lower() for x in p.parts]
+
+    if "fg" in parts:
+        # Have fg, need bg
+        bg_path = Path(str(p).replace("/fg/", "/bg/"))
+        if bg_path.exists():
+            trial.append(LayerChoice(group="hair_bg", path=bg_path))
+    elif "bg" in parts:
+        # Have bg, need fg — swap: fg becomes the main hair, bg becomes hair_bg
+        fg_path = Path(str(p).replace("/bg/", "/fg/"))
+        if fg_path.exists():
+            # Remove the bg entry we just added as "hair", re-add as hair_bg
+            trial[:] = [l for l in trial if not (l.group == "hair" and l.path == hair_path)]
+            trial.append(LayerChoice(group="hair", path=fg_path))
+            trial.append(LayerChoice(group="hair_bg", path=hair_path))
+
+
 def _sample_layer_combo(
     rng: random.Random,
     layer_pool: Dict[str, List[Path]],
@@ -851,6 +1474,14 @@ def _sample_layer_combo(
     if not body_candidates:
         raise RuntimeError("No body candidates found in layer pool")
 
+    # Exclude child and teen bodies — their small size causes face/hair rendering issues.
+    body_candidates = [
+        p for p in body_candidates
+        if _infer_body_style(p) not in ("child", "teen")
+    ]
+    if not body_candidates:
+        raise RuntimeError("No non-child/teen body candidates found")
+
     body_path = _choose_candidate(
         rng,
         body_candidates,
@@ -861,6 +1492,8 @@ def _sample_layer_combo(
     chosen_groups = {"body"}
     compatible_pool = compat_pool_by_body.get(body_path, {})
 
+    body_style = _infer_body_style(body_path)
+
     for group in groups:
         if group == "body":
             continue
@@ -869,6 +1502,31 @@ def _sample_layer_combo(
             continue
         candidates = _prefer_non_foreground(candidates, group)
         candidates = _prefer_semantic_candidates(rng, candidates, group)
+
+        # Female bodies: exclude minimal torso layers (aprons/bandage/waist)
+        # so they always get proper upper-body clothing.
+        if group == "torso" and body_style in ("female", "pregnant"):
+            clothed = [
+                p for p in candidates
+                if _extract_torso_subfolder(p) not in _TORSO_MINIMAL_SUBFOLDERS
+            ]
+            if clothed:
+                candidates = clothed
+
+        # Male and muscular bodies should not wear dresses.
+        if group == "dress" and body_style in ("male", "muscular"):
+            continue
+
+        # Exclude feminine hairstyles for male bodies.
+        if group == "hair" and body_style in ("male", "muscular"):
+            _FEMININE_HAIR_KEYWORDS = {"pigtails", "bunches"}
+            candidates = [
+                p for p in candidates
+                if not any(kw in str(p).lower() for kw in _FEMININE_HAIR_KEYWORDS)
+            ]
+            if not candidates:
+                continue
+
         dominant_color = _dominant_cloth_color(trial)
         candidates = _prefer_color_harmony(candidates, group=group, dominant_color=dominant_color)
 
@@ -883,7 +1541,7 @@ def _sample_layer_combo(
 
         if group in HANDHELD_EXCLUSIVE_GROUPS and chosen_groups.intersection(HANDHELD_EXCLUSIVE_GROUPS):
             continue
-        if group == "hat" and "hair" in chosen_groups and rng.random() < 0.70:
+        if group == "hat" and "hair" in chosen_groups:
             continue
         if group == "facial" and ("hair" in chosen_groups or "hat" in chosen_groups) and rng.random() < 0.15:
             continue
@@ -897,7 +1555,12 @@ def _sample_layer_combo(
         trial.append(LayerChoice(group=group, path=path))
         chosen_groups.add(group)
 
-    # 降低“光头”出现：若没抽到 hair，则在兼容池里强制补一层 hair（若存在）。
+        # Dual-layer hair: if hair path is in fg/ or bg/ subdir,
+        # add the complementary bg/ or fg/ tile as hair_bg group.
+        if group == "hair":
+            _add_hair_bg_layer(trial, path)
+
+    #降低光头出现
     if "hair" in groups and "hair" not in chosen_groups:
         hair_candidates = compatible_pool.get("hair") or layer_pool.get("hair")
         if hair_candidates:
@@ -911,6 +1574,8 @@ def _sample_layer_combo(
             )
             trial.append(LayerChoice(group="hair", path=hair_path))
             chosen_groups.add("hair")
+            # Also add bg layer for dual-layer hair
+            _add_hair_bg_layer(trial, hair_path)
 
     trial_sig = tuple(str(item.path) for item in trial)
     return trial, trial_sig
@@ -960,10 +1625,31 @@ def _compose_one_sample(
             chosen_layers = trial
 
         layer_paths = [str(choice.path) for choice in chosen_layers]
+
+        # Pre-rotate hair tile hue for child bodies so colour is uniform.
+        child_hue_key = None
+        child_hair_pre = next((l for l in chosen_layers if l.group == "hair"), None)
+        child_body_pre = next((l for l in chosen_layers if l.group == "body"), None)
+        if child_hair_pre and child_body_pre and _infer_body_style(child_body_pre.path) == "child":
+            ch_hue = rng.uniform(-0.15, 0.15)
+            ch_sheet = load_spritesheet(str(child_hair_pre.path))
+            ch_hf, ch_hb = extract_front_back(ch_sheet)
+            ch_hf = _rotate_tile_hue(ch_hf, ch_hue)
+            ch_hb = _rotate_tile_hue(ch_hb, ch_hue)
+            child_hue_key = (str(child_hair_pre.path), column)
+            tile_cache[child_hue_key] = (ch_hf, ch_hb)
+
+        y_off = _child_hair_y_offset(chosen_layers)
+        # Sort layers by z-order so hair_bg renders behind body, etc.
+        chosen_layers.sort(key=lambda l: GROUP_Z_ORDER.get(l.group, 50))
+        layer_paths = [str(choice.path) for choice in chosen_layers]
+        groups = [l.group for l in chosen_layers]
         front, back = _compose_layers_cached(
             layer_paths,
             col=column,
             tile_cache=tile_cache,
+            layer_groups=groups,
+            group_y_offsets=y_off,
         )
 
         if palette_shift_prob > 0.0 and rng.random() < palette_shift_prob:
@@ -975,20 +1661,15 @@ def _compose_one_sample(
                 max_s=palette_s,
                 max_v=palette_v,
             )
-        elif any(x.group == "hair" for x in chosen_layers) and rng.random() < 0.4:
-            # 额外提升发色多样性（轻度），避免整体都落在少量固定发色。
-            front, back = random_palette_shift(
-                front,
-                back,
-                p=1.0,
-                max_h=max(palette_h, 0.1),
-                max_s=max(palette_s, 0.18),
-                max_v=max(palette_v, 0.16),
-            )
 
         if _passes_all_constraints(chosen_layers, front, back, column=column, tile_cache=tile_cache):
             accepted_front, accepted_back = front, back
+            if child_hue_key is not None:
+                tile_cache.pop(child_hue_key, None)
             break
+
+        if child_hue_key is not None:
+            tile_cache.pop(child_hue_key, None)
 
     if accepted_front is None or accepted_back is None:
         repaired_layers, repaired_front, repaired_back, ok = _repair_layers_for_constraints(
@@ -1013,13 +1694,21 @@ def _compose_one_sample(
                 tile_cache=tile_cache,
                 rng=rng,
             )
+            repaired_layers.sort(key=lambda l: GROUP_Z_ORDER.get(l.group, 50))
             layer_paths = [str(choice.path) for choice in repaired_layers]
+            y_off2 = _child_hair_y_offset(repaired_layers)
+            groups2 = [l.group for l in repaired_layers]
             accepted_front, accepted_back = _compose_layers_cached(
                 layer_paths,
                 col=column,
                 tile_cache=tile_cache,
+                layer_groups=groups2,
+                group_y_offsets=y_off2,
             )
             chosen_layers = repaired_layers
+
+    # Hair hue rotation REMOVED — was causing hair to become invisible
+    # or mismatch with the pixel-detected hair_color label.
 
     base_name = f"{prefix}_{idx:04d}"
     save_pair(accepted_front, accepted_back, str(out_dir), base_name)
@@ -1029,7 +1718,7 @@ def _compose_one_sample(
     return chosen_layers
 
 
-def _compose_one_sample_worker(args: tuple) -> Tuple[int, List[LayerChoice]]:
+def _compose_one_sample_worker(args: tuple) -> Tuple[int, List[LayerChoice], dict]:
     (
         idx,
         layer_pool,
@@ -1066,7 +1755,18 @@ def _compose_one_sample_worker(args: tuple) -> Tuple[int, List[LayerChoice]]:
         tile_cache=local_cache,
         enforce_unique=False,
     )
-    return idx, layers
+    attrs = _extract_attributes(layers)
+
+    # Fix hair_color: pixel-based detection when path extraction fails
+    if attrs.get("hair_color") is None:
+        hair_path = next((l.path for l in layers if l.group == "hair"), None)
+        if hair_path is not None:
+            front_path = Path(out_dir) / f"{prefix}_{idx:04d}_front.png"
+            if front_path.exists():
+                front_img = Image.open(front_path).convert("RGBA")
+                attrs["hair_color"] = _detect_hair_color(front_img, hair_path)
+
+    return idx, layers, attrs
 
 
 def random_compose_batch(
@@ -1111,6 +1811,8 @@ def random_compose_batch(
         # 默认优先单进程：可复用缓存、保留全局去重与全局多样性采样。
         num_workers = 1
 
+    attributes_data: Dict[str, dict] = {}
+
     if num_workers == 1:
         used_signatures = set()
         usage_counts: DefaultDict[str, Dict[Path, int]] = defaultdict(dict)
@@ -1138,12 +1840,32 @@ def random_compose_batch(
                         break
                     chosen_layers = trial
 
+                # Pre-rotate hair tile hue
+                seq_hair_pre = next((l for l in chosen_layers if l.group == "hair"), None)
+                seq_rotated_key = None
+                if seq_hair_pre is not None:
+                    seq_hue = local_rng.uniform(-0.15, 0.15)
+                    seq_sheet = load_spritesheet(str(seq_hair_pre.path))
+                    seq_hf, seq_hb = extract_front_back(seq_sheet)
+                    seq_hf = _rotate_tile_hue(seq_hf, seq_hue)
+                    seq_hb = _rotate_tile_hue(seq_hb, seq_hue)
+                    seq_rotated_key = (str(seq_hair_pre.path), column)
+                    tile_cache[seq_rotated_key] = (seq_hf, seq_hb)
+
+                chosen_layers.sort(key=lambda l: GROUP_Z_ORDER.get(l.group, 50))
                 layer_paths = [str(choice.path) for choice in chosen_layers]
+                seq_y_off = _child_hair_y_offset(chosen_layers)
+                seq_groups = [l.group for l in chosen_layers]
                 front, back = _compose_layers_cached(
                     layer_paths,
                     col=column,
                     tile_cache=tile_cache,
+                    layer_groups=seq_groups,
+                    group_y_offsets=seq_y_off,
                 )
+
+                if seq_rotated_key is not None:
+                    del tile_cache[seq_rotated_key]
 
                 if palette_shift_prob > 0.0 and local_rng.random() < palette_shift_prob:
                     front, back = random_palette_shift(
@@ -1153,15 +1875,6 @@ def random_compose_batch(
                         max_h=palette_h,
                         max_s=palette_s,
                         max_v=palette_v,
-                    )
-                elif any(x.group == "hair" for x in chosen_layers) and local_rng.random() < 0.4:
-                    front, back = random_palette_shift(
-                        front,
-                        back,
-                        p=1.0,
-                        max_h=max(palette_h, 0.1),
-                        max_s=max(palette_s, 0.18),
-                        max_v=max(palette_v, 0.16),
                     )
 
                 if _passes_all_constraints(chosen_layers, front, back, column=column, tile_cache=tile_cache):
@@ -1191,16 +1904,35 @@ def random_compose_batch(
                         tile_cache=tile_cache,
                         rng=local_rng,
                     )
+                    repaired_layers.sort(key=lambda l: GROUP_Z_ORDER.get(l.group, 50))
                     layer_paths = [str(choice.path) for choice in repaired_layers]
+                    fb_y_off = _child_hair_y_offset(repaired_layers)
+                    fb_groups = [l.group for l in repaired_layers]
                     accepted_front, accepted_back = _compose_layers_cached(
                         layer_paths,
                         col=column,
                         tile_cache=tile_cache,
+                        layer_groups=fb_groups,
+                        group_y_offsets=fb_y_off,
                     )
                     chosen_layers = repaired_layers
 
+            # Hair hue rotation REMOVED — was causing hair to become invisible
+            # or mismatch with the pixel-detected hair_color label.
+
             base_name = f"{prefix}_{idx:04d}"
             save_pair(accepted_front, accepted_back, str(out_path), base_name)
+            attrs = _extract_attributes(chosen_layers)
+            if attrs.get("hair_color") is None:
+                hair_path = next((l.path for l in chosen_layers if l.group == "hair"), None)
+                if hair_path is not None:
+                    front_path = Path(str(out_path)) / f"{prefix}_{idx:04d}_front.png"
+                    if front_path.exists():
+                        front_img = Image.open(front_path).convert("RGBA")
+                        attrs["hair_color"] = _detect_hair_color(front_img, hair_path)
+            attributes_data[base_name] = attrs
+            # Record chosen layers for debugging
+            attrs["_layers"] = [{"group": l.group, "path": str(l.path)} for l in chosen_layers]
             for layer in chosen_layers:
                 usage_counts[layer.group][layer.path] = usage_counts[layer.group].get(layer.path, 0) + 1
             selections.extend(chosen_layers)
@@ -1226,9 +1958,17 @@ def random_compose_batch(
         ]
 
         with ProcessPoolExecutor(max_workers=num_workers) as ex:
-            for idx, chosen_layers in ex.map(_compose_one_sample_worker, task_args):
-                _ = idx
+            for idx, chosen_layers, attrs in ex.map(_compose_one_sample_worker, task_args):
+                base_name = f"{prefix}_{idx:04d}"
+                attrs["_layers"] = [{"group": l.group, "path": str(l.path)} for l in chosen_layers]
+                attributes_data[base_name] = attrs
                 selections.extend(chosen_layers)
+
+    if attributes_data:
+        attrs_path = out_path / "attributes.json"
+        with open(attrs_path, "w") as f:
+            json.dump(attributes_data, f, indent=2)
+        print(f"[random_composer] saved attributes for {len(attributes_data)} samples to {attrs_path}")
 
     return selections
 

@@ -241,14 +241,44 @@ class SpritePairDataset(_BaseSpriteDataset):
 
     数据布局：front 和 back 水平拼接为一张 2:1 的大图，包含 4 通道（RGBA）。
     这样 UNet 的输入/输出统一为 (4, H, 2W)，避免了 6 通道版本那种
-    将 front/back “塞到通道维度”的不自然方式。
+    将 front/back "塞到通道维度"的不自然方式。
 
     __getitem__ returns a dict:
         "front":  (4, H, W) float32 in [−1, 1]
         "back":   (4, H, W) float32 in [−1, 1]
         "paired": (4, H, 2W) 水平拼接的训练输入
         "mask":   (1, H, 2W) 二值前景 mask（主要用于诊断、或可选加权）
+        "attributes": dict of attribute values (if attributes_json provided)
     """
+
+    def __init__(
+        self,
+        data_source: Union[str, Sequence[str]],
+        image_size: int = 64,
+        augment: bool = True,
+        transform: Optional[Callable] = None,
+        source_weights: Optional[Sequence[float]] = None,
+        attributes_json: Optional[str] = None,
+    ) -> None:
+        super().__init__(data_source, image_size, augment, transform, source_weights=source_weights)
+        self._attributes: Optional[dict] = None
+        if attributes_json is not None:
+            import json
+            with open(attributes_json, "r") as f:
+                raw = json.load(f)
+            # Build index: match pair filename stem → attributes
+            self._attributes = {}
+            for key, attrs in raw.items():
+                self._attributes[key] = attrs
+
+    def _get_attributes(self, idx: int) -> Optional[dict]:
+        if self._attributes is None:
+            return None
+        front_path, _ = self.pairs[idx]
+        # Derive key from filename: e.g. "data/.../char_0000_front.png" → "char_0000"
+        stem = Path(front_path).stem
+        key = stem.replace("_front", "").replace("_back", "")
+        return self._attributes.get(key)
 
     def __getitem__(self, idx: int):  # type: ignore[override]
         front_img, back_img = self._load_pair(idx)
@@ -266,12 +296,16 @@ class SpritePairDataset(_BaseSpriteDataset):
         # alpha mask 也水平拼接，维度 (1, H, 2W)
         mask = torch.cat([front_alpha, back_alpha], dim=2)
 
-        return {
+        result = {
             "front": front_t,
             "back": back_t,
             "paired": paired,
             "mask": mask,
         }
+        attrs = self._get_attributes(idx)
+        if attrs is not None:
+            result["attributes"] = attrs
+        return result
 
 
 # ---------------------------------------------------------------------------

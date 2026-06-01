@@ -1,0 +1,52 @@
+# Random batch v2 conditional training config
+
+data:
+  train_dir: "data/pairs/random_batch_v3/index_train.csv"
+  val_dir: "data/pairs/random_batch_v3/index_val.csv"
+  attributes_json: "data/pairs/random_batch_v3/attributes.json"
+  image_size: 64
+
+model:
+  in_channels: 4
+  out_channels: 4
+  model_channels: 64
+  channel_mults: [1, 2, 4, 8]
+  n_res_blocks: 2
+  attn_resolutions: [8, 16]
+  time_emb_dim: 256
+  dropout: 0.1
+  cross_attn_heads: 4
+
+attributes:
+  embed_dim: 64
+  output_dim: 256
+  token_dim: 256
+  use_pos_embed: true
+
+flow:
+  time_scale: 999.0
+  sample_steps: 60
+
+training:
+  device: "auto"
+  epochs: 200
+  batch_size: 64
+  num_workers: 4
+  lr: 1.0e-4
+  lr_min: 1.0e-6
+  weight_decay: 1.0e-4
+  ema_decay: 0.999
+
+  background_weight: 0.6
+  foreground_weight: 6.0
+  alpha_weight: 0.8
+
+  cfg_dropout: 0.2
+  guidance_scale: 3.0
+
+  val_every: 10
+  save_every: 25
+  sample_every: 25
+  sample_count: 16
+
+  out_dir: "outputs/random_batch_v3"

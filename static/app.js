@@ -8,53 +8,16 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     });
 });
 
-// Helpers
-function showLoading() {
-    document.getElementById('loading').classList.remove('hidden');
-}
-function hideLoading() {
-    document.getElementById('loading').classList.add('hidden');
-}
+function showLoading() { document.getElementById('loading').classList.remove('hidden'); }
+function hideLoading() { document.getElementById('loading').classList.add('hidden'); }
 function showError(msg) {
     const el = document.getElementById('error');
     el.textContent = msg;
     el.classList.remove('hidden');
 }
-function hideError() {
-    document.getElementById('error').classList.add('hidden');
-}
+function hideError() { document.getElementById('error').classList.add('hidden'); }
 
-// ========== Tab 1: FLUX 角色生成 ==========
-document.getElementById('btn-flux').addEventListener('click', async () => {
-    hideError();
-    showLoading();
-    document.getElementById('flux-result').classList.add('hidden');
-
-    const charType = document.getElementById('char-type').value;
-    const charDesc = document.getElementById('char-desc').value.trim();
-    let prompt = charType;
-    if (charDesc) prompt += ', ' + charDesc;
-
-    try {
-        const resp = await fetch('/api/generate_flux', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt: prompt }),
-        });
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.error || 'Generation failed');
-
-        document.getElementById('flux-front').src = 'data:image/png;base64,' + data.front;
-        document.getElementById('flux-back').src = 'data:image/png;base64,' + data.back;
-        document.getElementById('flux-result').classList.remove('hidden');
-    } catch (err) {
-        showError(err.message);
-    } finally {
-        hideLoading();
-    }
-});
-
-// ========== Tab 2: 正面 → 反面 ==========
+// ========== Tab 1: 正面 → 反面 ==========
 const uploadArea = document.getElementById('upload-area');
 const fileInput = document.getElementById('front-upload');
 const uploadPreview = document.getElementById('upload-preview');
@@ -67,10 +30,7 @@ uploadArea.addEventListener('dragover', (e) => {
     e.preventDefault();
     uploadArea.classList.add('dragover');
 });
-
-uploadArea.addEventListener('dragleave', () => {
-    uploadArea.classList.remove('dragover');
-});
+uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('dragover'));
 
 uploadArea.addEventListener('drop', (e) => {
     e.preventDefault();
@@ -89,6 +49,8 @@ function handleFile(file) {
     reader.onload = (e) => {
         uploadPreview.src = e.target.result;
         uploadPreview.classList.remove('hidden');
+        // Hide upload text content
+        document.querySelector('.upload-content').style.display = 'none';
         btnTask2.disabled = false;
     };
     reader.readAsDataURL(file);

@@ -31,6 +31,9 @@ class FlowMatching(nn.Module):
         foreground_weight: float = 1.0,
         alpha_weight: float = 1.0,
         return_components: bool = False,
+        attr_cond: torch.Tensor | None = None,
+        attr_tokens: torch.Tensor | None = None,
+        cfg_dropout: float = 0.0,
     ):
         b = x0.shape[0]
         t = torch.rand(b, device=x0.device)
@@ -40,7 +43,17 @@ class FlowMatching(nn.Module):
         x_t = (1.0 - t_view) * x0 + t_view * z
         target_v = z - x0
 
-        pred_v = self.model(x_t, t * self.time_scale)
+        # CFG dropout: independently zero out both conditioning signals
+        if cfg_dropout > 0.0 and self.training:
+            drop_mask = torch.rand(b, device=x0.device) < cfg_dropout
+            if attr_cond is not None:
+                attr_cond = attr_cond.clone()
+                attr_cond[drop_mask] = 0.0
+            if attr_tokens is not None:
+                attr_tokens = attr_tokens.clone()
+                attr_tokens[drop_mask] = 0.0
+
+        pred_v = self.model(x_t, t * self.time_scale, attr_cond=attr_cond, attr_tokens=attr_tokens)
         sq = (pred_v - target_v) ** 2
 
         weights = torch.ones_like(sq)
@@ -79,16 +92,28 @@ class FlowMatching(nn.Module):
         return loss, components
 
     @torch.no_grad()
-    def sample(self, sample_shape: tuple[int, int, int, int], steps: int = 50) -> torch.Tensor:
+    def sample(
+        self,
+        sample_shape: tuple[int, int, int, int],
+        steps: int = 50,
+        attr_cond: torch.Tensor | None = None,
+        attr_tokens: torch.Tensor | None = None,
+        guidance_scale: float = 1.0,
+    ) -> torch.Tensor:
         device = next(self.model.parameters()).device
         x = torch.randn(sample_shape, device=device)
 
-        # Integrate reverse ODE from t=1 -> 0 with explicit Euler.
         for i in range(steps, 0, -1):
             t_cur = torch.full((sample_shape[0],), i / steps, device=device)
             t_next = (i - 1) / steps
             dt = t_next - (i / steps)
-            v = self.model(x, t_cur * self.time_scale)
+
+            if (attr_cond is not None or attr_tokens is not None) and guidance_scale != 1.0:
+                v_uncond = self.model(x, t_cur * self.time_scale, attr_cond=None, attr_tokens=None)
+                v_cond = self.model(x, t_cur * self.time_scale, attr_cond=attr_cond, attr_tokens=attr_tokens)
+                v = v_uncond + guidance_scale * (v_cond - v_uncond)
+            else:
+                v = self.model(x, t_cur * self.time_scale, attr_cond=attr_cond, attr_tokens=attr_tokens)
             x = x + dt * v
 
         return x.clamp(-1.0, 1.0)
