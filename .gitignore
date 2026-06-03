@@ -58,3 +58,5 @@ Universal-LPC-Spritesheet-Character-Generator/
 # Temp/generated preview files
 static/sample_grid.png
 static/sample_preview.html
+
+report/
